@@ -39,10 +39,10 @@ MIN_SCREEN_AREA_RATIO = 0.10
 APPROX_EPSILON_RATIO = 0.02
 
 CALIBRATION_COLORS = {
-    "RED": (0, 0, 255),
+    "RED": (210, 77, 96),
     "BLUE": (255, 0, 0),
-    "GREEN": (0, 255, 0),
-    "WHITE": (255, 255, 255),
+    "GREEN": (86, 215, 85),
+    "WHITE": (219, 218, 220),
 }
 
 
