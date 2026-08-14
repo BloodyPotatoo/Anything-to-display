@@ -246,17 +246,28 @@ def resize_to_reference(frame, reference_shape):
     return cv2.resize(frame, (width, height))
 
 
-
 # ============================================================
 # RGBW TEMPORAL SCREEN DETECTION SETTINGS
+#
+# The camera stays fixed while the projector changes:
+# RED -> GREEN -> BLUE -> WHITE.
+# We detect the region whose Lab colour changes strongly.
 # ============================================================
-# The projector changes RED -> GREEN -> BLUE -> WHITE while the
-# camera remains fixed. We detect the region whose Lab colour
-# changes strongly across those captures.
+
+# Higher percentile = stricter/smaller candidate region.
+# Lower percentile = more permissive/larger candidate region.
 RGBW_CHANGE_PERCENTILE = 92
+
+# Minimum Lab colour-change score.
 RGBW_MIN_CHANGE = 18
+
+# Morphological closing kernel used to join gaps in the screen.
 RGBW_CLOSE_KERNEL = 31
+
+# Ignore very small disconnected components.
 RGBW_MIN_COMPONENT_RATIO = 0.015
+
+# Contour approximation epsilon.
 RGBW_APPROX_EPSILON = 0.02
 
 def build_rgbw_screen_mask(captures):

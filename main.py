@@ -1,9 +1,6 @@
 import os
 import sys
 
-from coordinate_mapper import CoordinateMapper
-from light_detection import run_light_detection
-
 
 CALIBRATION_FILE = "screen_corners.npy"
 
@@ -14,13 +11,19 @@ def run_calibration():
     calibration_main()
 
 
+def run_whiteboard():
+    from whiteboard import main as whiteboard_main
+
+    whiteboard_main()
+
+
 def main():
     print("\n" + "=" * 70)
     print("SMARTIR - WII REMOTE STYLE DIGITAL WHITEBOARD")
     print("=" * 70)
 
     # --------------------------------------------------------
-    # STEP 1: Calibration
+    # STEP 1: Make sure screen calibration exists
     # --------------------------------------------------------
 
     if not os.path.exists(CALIBRATION_FILE):
@@ -62,22 +65,20 @@ def main():
         return
 
     # --------------------------------------------------------
-    # STEP 3: Load coordinate transformation
+    # STEP 3: START THE ACTUAL DRAWING APPLICATION
+    #
+    # IMPORTANT:
+    # Do NOT call run_light_detection() here.
+    #
+    # light_detection.py is the detector/test component.
+    # whiteboard.py is the actual application that:
+    #
+    #   camera -> detect light -> homography -> draw
     # --------------------------------------------------------
 
-    print("\nLoading coordinate mapper...")
+    print("\nLoading coordinate mapper and starting whiteboard...")
 
-    mapper = CoordinateMapper()
-
-    mapper.print_info()
-
-    # --------------------------------------------------------
-    # STEP 4: Detect IR / bright light
-    # --------------------------------------------------------
-
-    print("\nStarting light/IR detection...")
-
-    run_light_detection(mapper)
+    run_whiteboard()
 
 
 if __name__ == "__main__":
