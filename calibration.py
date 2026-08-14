@@ -1,82 +1,101 @@
 import cv2
 import numpy as np
+import platform
 import time
 import sys
-import platform
-
 
 # ============================================================
-# SMARTIR DIGITAL NOTEBOOK
-# UNIVERSAL PROJECTOR SCREEN CALIBRATION
+# SMARTIR - RGBW SCREEN CALIBRATION
 #
-# Camera handling is designed to work across:
-#   - Linux / V4L2
-#   - Windows / Media Foundation or DirectShow
-#   - macOS / AVFoundation
+# Logic:
+#   RED capture  -> red screen mask
+#   GREEN capture -> green screen mask
+#   BLUE capture -> blue screen mask
+#   WHITE capture -> white/bright screen mask
 #
-# The program automatically searches for a usable camera instead
-# of assuming /dev/video1 or camera index 1.
-# ============================================================
-
-
-# ============================================================
-# CONFIGURATION
+# The final screen region is the INTERSECTION:
+#
+#   RED ∩ GREEN ∩ BLUE ∩ WHITE
+#
+# This prevents unrelated objects/background areas from becoming
+# part of the calibrated screen.
 # ============================================================
 
 CAMERA_WIDTH = 1280
 CAMERA_HEIGHT = 720
 CAMERA_FPS = 30
-
-# Camera indices to search.
 MAX_CAMERA_INDEX = 10
 
-AVERAGE_FRAMES = 30
+AVERAGE_FRAMES = 20
 FRAME_DELAY = 0.03
 
-CR_THRESHOLD = 20
+# Basic color-detection floors used by the adaptive detector.
+MIN_COLOR_SATURATION = 10
+MIN_COLOR_VALUE = 25
+
+# ============================================================
+# CALIBRATION TOLERANCE SETTINGS
+#
+# IMPORTANT:
+# We do NOT require the RGB masks to line up pixel-for-pixel.
+# Projector/camera auto-exposure, auto-white-balance, noise and
+# tiny camera movements can shift the detected boundaries.
+#
+# Each RGB mask is therefore:
+#   1. detected using broad VALUE thresholds
+#   2. cleaned
+#   3. expanded by INTERSECTION_TOLERANCE_PIXELS
+#   4. intersected with the other masks
+#
+# This gives a REAL intersection with spatial tolerance.
+# ============================================================
+
+# Minimum channel difference required to say that a pixel is
+# meaningfully colored. Keep this low for webcams.
+COLOR_DIFFERENCE_THRESHOLD = 3
+
+# Minimum dominance of the expected RGB channel.
+COLOR_DOMINANCE_THRESHOLD = 3
+
+# White screen threshold.
+MIN_WHITE_VALUE = 35
+MAX_WHITE_SATURATION = 220
+
+# Instead of requiring exact overlap, allow each mask to be
+# expanded by this many pixels before intersection.
+#
+# 15-30 is a good range for a 1280x720 webcam image.
+INTERSECTION_TOLERANCE_PIXELS = 100
+
+# Final intersection threshold after confidence calculation.
+INTERSECTION_THRESHOLD = 25
+
+# The screen should occupy at least this much of the camera frame.
+MIN_SCREEN_AREA_RATIO = 0.015
+
 MORPH_KERNEL_SIZE = 7
-MIN_SCREEN_AREA_RATIO = 0.10
 APPROX_EPSILON_RATIO = 0.02
 
+# OpenCV uses BGR here.
 CALIBRATION_COLORS = {
-    "RED": (210, 77, 96),
+    "RED": (0, 0, 255),
+    "GREEN": (0, 255, 0),
     "BLUE": (255, 0, 0),
-    "GREEN": (86, 215, 85),
-    "WHITE": (219, 218, 220),
+    "WHITE": (255, 255, 255),
 }
 
 
-# ============================================================
-# CAMERA BACKEND SELECTION
-# ============================================================
-
 def get_camera_backends():
-    """
-    Return sensible OpenCV backends for the current OS.
-
-    CAP_ANY is included as the final fallback so OpenCV can choose
-    whatever backend is available on the machine.
-    """
     system = platform.system()
 
     if system == "Windows":
-        return [
-            cv2.CAP_MSMF,
-            cv2.CAP_DSHOW,
-            cv2.CAP_ANY,
-        ]
+        return [cv2.CAP_MSMF, cv2.CAP_DSHOW, cv2.CAP_ANY]
 
     if system == "Darwin":
-        return [
-            cv2.CAP_AVFOUNDATION,
-            cv2.CAP_ANY,
-        ]
+        return [cv2.CAP_AVFOUNDATION, cv2.CAP_ANY]
 
     if system == "Linux":
-        return [
-            cv2.CAP_V4L2,
-            cv2.CAP_ANY,
-        ]
+        return [cv2.CAP_V4L2, cv2.CAP_ANY]
 
     return [cv2.CAP_ANY]
 
@@ -89,56 +108,25 @@ def backend_name(backend):
         cv2.CAP_DSHOW: "DirectShow",
         cv2.CAP_AVFOUNDATION: "AVFoundation",
     }
-
     return names.get(backend, str(backend))
 
 
-# ============================================================
-# TEST A CAMERA
-# ============================================================
-
 def try_camera(index, backend):
-    """
-    Try opening one camera index using one backend.
-
-    Returns:
-        cap, frame
-    or:
-        None, None
-    """
-
-    print(
-        f"Trying camera index {index} "
-        f"using {backend_name(backend)}..."
-    )
+    print(f"Trying camera index {index} using {backend_name(backend)}...")
 
     try:
         cap = cv2.VideoCapture(index, backend)
     except Exception:
-        return None, None
+        return None
 
     if not cap.isOpened():
         cap.release()
-        return None, None
+        return None
 
-    # Try the requested resolution.
-    cap.set(
-        cv2.CAP_PROP_FRAME_WIDTH,
-        CAMERA_WIDTH
-    )
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+    cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
 
-    cap.set(
-        cv2.CAP_PROP_FRAME_HEIGHT,
-        CAMERA_HEIGHT
-    )
-
-    cap.set(
-        cv2.CAP_PROP_FPS,
-        CAMERA_FPS
-    )
-
-    # MJPEG is especially useful for USB webcams on Linux.
-    # On other systems OpenCV may ignore this setting, which is fine.
     try:
         cap.set(
             cv2.CAP_PROP_FOURCC,
@@ -147,348 +135,360 @@ def try_camera(index, backend):
     except Exception:
         pass
 
-    # Give the camera a moment to start.
     time.sleep(0.2)
 
-    # Some cameras return empty frames immediately after opening.
-    frame = None
-
     for _ in range(10):
-        ret, candidate = cap.read()
-
-        if ret and candidate is not None and candidate.size > 0:
-            frame = candidate
-            break
-
+        ret, frame = cap.read()
+        if ret and frame is not None and frame.size:
+            if len(frame.shape) == 3 and frame.shape[2] == 3:
+                return cap
         time.sleep(0.05)
 
-    if frame is None:
-        cap.release()
-        return None, None
+    cap.release()
+    return None
 
-    # Basic sanity check.
-    if len(frame.shape) != 3 or frame.shape[2] != 3:
-        cap.release()
-        return None, None
-
-    return cap, frame
-
-
-# ============================================================
-# AUTOMATIC CAMERA DETECTION
-# ============================================================
 
 def open_camera():
-    """
-    Automatically find a working camera.
-
-    No fixed /dev/videoX path is required.
-    """
-
-    print()
-    print("=" * 60)
+    print("\n" + "=" * 60)
     print("AUTOMATIC CAMERA DETECTION")
     print("=" * 60)
 
-    backends = get_camera_backends()
-
     for index in range(MAX_CAMERA_INDEX):
-
-        for backend in backends:
-
-            cap, frame = try_camera(
-                index,
-                backend
-            )
-
+        for backend in get_camera_backends():
+            cap = try_camera(index, backend)
             if cap is not None:
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                fps = cap.get(cv2.CAP_PROP_FPS)
 
-                actual_width = int(
-                    cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-                )
-
-                actual_height = int(
-                    cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-                )
-
-                actual_fps = cap.get(
-                    cv2.CAP_PROP_FPS
-                )
-
-                print()
-                print("Camera found!")
+                print("\nCamera found!")
                 print("Index:", index)
                 print("Backend:", backend_name(backend))
-                print(
-                    f"Resolution: "
-                    f"{actual_width} x {actual_height}"
-                )
-                print(
-                    f"FPS: {actual_fps:.1f}"
-                )
-                print(
-                    "Frame shape:",
-                    frame.shape
-                )
+                print(f"Resolution: {width} x {height}")
+                print(f"FPS: {fps:.1f}")
                 print("=" * 60)
-
-                # Disable auto white balance where supported.
-                try:
-                    cap.set(
-                        cv2.CAP_PROP_AUTO_WB,
-                        0
-                    )
-                except Exception:
-                    pass
-
                 return cap
 
-    print()
-    print("ERROR: No working camera was found.")
-    print()
-    print("Make sure:")
-    print("  1. A webcam is connected.")
-    print("  2. No other application is exclusively using it.")
-    print("  3. Camera permissions are enabled.")
-    print()
-    sys.exit(1)
+    raise RuntimeError("No usable camera was found.")
 
-
-# ============================================================
-# PROJECTOR WINDOW
-# ============================================================
 
 def create_projector_window():
-    window_name = "PROJECTOR"
-
-    cv2.namedWindow(
-        window_name,
-        cv2.WINDOW_NORMAL
-    )
-
+    name = "PROJECTOR"
+    cv2.namedWindow(name, cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(
-        window_name,
+        name,
         cv2.WND_PROP_FULLSCREEN,
         cv2.WINDOW_FULLSCREEN
     )
+    return name
 
-    return window_name
-
-
-# ============================================================
-# SHOW CALIBRATION COLOR
-# ============================================================
 
 def show_color(window_name, color):
     image = np.zeros(
         (CAMERA_HEIGHT, CAMERA_WIDTH, 3),
         dtype=np.uint8
     )
-
     image[:] = color
-
-    cv2.imshow(
-        window_name,
-        image
-    )
-
+    cv2.imshow(window_name, image)
     cv2.waitKey(1)
 
 
-# ============================================================
-# WAIT FOR USER CONFIRMATION
-# ============================================================
-
 def wait_for_confirmation(color_name):
-    print()
-    print("=" * 60)
+    print("\n" + "=" * 60)
     print(f"SHOW {color_name}")
-    print("Position the projector correctly.")
+    print("Make sure the projector covers the intended screen area.")
     print("Press ENTER in this terminal to capture.")
     print("Type Q and press ENTER to quit.")
     print("=" * 60)
 
     try:
-        user_input = input().strip().lower()
+        answer = input().strip().lower()
     except (EOFError, KeyboardInterrupt):
         return False
 
-    if user_input == "q":
-        return False
-
-    return True
+    return answer != "q"
 
 
-# ============================================================
-# FRAME AVERAGING
-# ============================================================
-
-def capture_average_frame(cap, number_of_frames):
-    print(
-        f"\nCapturing {number_of_frames} frames..."
-    )
-
+def capture_average_frame(cap):
     frames = []
 
-    for i in range(number_of_frames):
+    print(f"Capturing {AVERAGE_FRAMES} frames...")
 
+    for i in range(AVERAGE_FRAMES):
         ret, frame = cap.read()
 
-        if not ret or frame is None:
-            print(
-                f"\nWARNING: Failed to read "
-                f"frame {i + 1}."
-            )
-            continue
-
-        frames.append(
-            frame.astype(np.float32)
-        )
-
-        cv2.imshow(
-            "Camera Preview",
-            frame
-        )
+        if ret and frame is not None and frame.size:
+            frames.append(frame.astype(np.float32))
 
         cv2.waitKey(1)
-
         time.sleep(FRAME_DELAY)
-
         print(
-            f"\rFrame {i + 1}/{number_of_frames}",
+            f"\rFrame {i + 1}/{AVERAGE_FRAMES}",
             end="",
             flush=True
         )
 
     print()
 
-    if len(frames) == 0:
-        raise RuntimeError(
-            "No camera frames captured."
-        )
+    if not frames:
+        raise RuntimeError("Could not capture any camera frames.")
 
-    average = np.mean(
-        frames,
+    average = np.mean(frames, axis=0)
+    return np.clip(average, 0, 255).astype(np.uint8)
+
+
+def resize_to_reference(frame, reference_shape):
+    height, width = reference_shape[:2]
+
+    if frame.shape[:2] == (height, width):
+        return frame
+
+    return cv2.resize(frame, (width, height))
+
+
+
+# ============================================================
+# RGBW TEMPORAL SCREEN DETECTION SETTINGS
+# ============================================================
+# The projector changes RED -> GREEN -> BLUE -> WHITE while the
+# camera remains fixed. We detect the region whose Lab colour
+# changes strongly across those captures.
+RGBW_CHANGE_PERCENTILE = 92
+RGBW_MIN_CHANGE = 18
+RGBW_CLOSE_KERNEL = 31
+RGBW_MIN_COMPONENT_RATIO = 0.015
+RGBW_APPROX_EPSILON = 0.02
+
+def build_rgbw_screen_mask(captures):
+    """
+    Detect the physical projected screen from the FOUR captures.
+
+    Core idea:
+        The camera is fixed.
+        The projector changes:
+            RED -> GREEN -> BLUE -> WHITE
+
+        Therefore pixels belonging to the projector screen change
+        strongly in colour across the four frames, while most of the
+        room/background stays comparatively stable.
+
+    We measure the per-pixel range in CIE-Lab chroma (a*, b*) and
+    brightness. This is much more reliable than asking four separate
+    masks to overlap.
+    """
+    names = ["RED", "GREEN", "BLUE", "WHITE"]
+
+    frames = [
+        captures[name].astype(np.uint8)
+        for name in names
+    ]
+
+    # All frames should already have the same size, but explicitly
+    # resize just in case a backend changes resolution.
+    reference_shape = frames[0].shape[:2]
+    frames = [
+        resize_to_reference(frame, frames[0].shape)
+        for frame in frames
+    ]
+
+    lab_frames = [
+        cv2.cvtColor(frame, cv2.COLOR_BGR2LAB).astype(np.float32)
+        for frame in frames
+    ]
+
+    # OpenCV Lab:
+    #   L = lightness
+    #   a = green <-> red
+    #   b = blue <-> yellow
+    #
+    # RGB projector changes produce a large range in a/b.
+    a_stack = np.stack(
+        [lab[:, :, 1] for lab in lab_frames],
         axis=0
     )
 
-    average = np.clip(
-        average,
-        0,
-        255
+    b_stack = np.stack(
+        [lab[:, :, 2] for lab in lab_frames],
+        axis=0
+    )
+
+    l_stack = np.stack(
+        [lab[:, :, 0] for lab in lab_frames],
+        axis=0
+    )
+
+    a_range = np.ptp(a_stack, axis=0)
+    b_range = np.ptp(b_stack, axis=0)
+    l_range = np.ptp(l_stack, axis=0)
+
+    # Chroma variation is the primary signal.
+    chroma_range = np.sqrt(
+        a_range * a_range +
+        b_range * b_range
+    )
+
+    # Combine chroma and brightness change.
+    change_score = (
+        chroma_range +
+        0.35 * l_range
+    )
+
+    # Ignore tiny numerical/camera noise.
+    change_score = cv2.GaussianBlur(
+        change_score.astype(np.float32),
+        (5, 5),
+        0
+    )
+
+    # Adaptive threshold:
+    # the screen should be among the strongest-changing regions.
+    #
+    # We use a high percentile rather than a fixed RGB value.
+    percentile_threshold = np.percentile(
+        change_score,
+        RGBW_CHANGE_PERCENTILE
+    )
+
+    threshold = max(
+        RGBW_MIN_CHANGE,
+        float(percentile_threshold)
+    )
+
+    mask = np.where(
+        change_score >= threshold,
+        255,
+        0
     ).astype(np.uint8)
 
-    print(
-        f"Successfully averaged "
-        f"{len(frames)} frames."
-    )
+    # Clean isolated noise.
+    mask = clean_mask(mask)
 
-    return average
-
-
-# ============================================================
-# BGR -> YCrCb
-# ============================================================
-
-def convert_to_ycrcb(frame):
-    return cv2.cvtColor(
-        frame,
-        cv2.COLOR_BGR2YCrCb
-    )
-
-
-# ============================================================
-# CR CHANNEL
-# ============================================================
-
-def extract_cr(frame_ycrcb):
-    return frame_ycrcb[:, :, 1]
-
-
-# ============================================================
-# COLOR DIFFERENCE
-# ============================================================
-
-def calculate_difference(
-    color_cr,
-    white_cr
-):
-    return cv2.absdiff(
-        color_cr,
-        white_cr
-    )
-
-
-# ============================================================
-# THRESHOLDING
-# ============================================================
-
-def threshold_difference(difference):
-    _, mask = cv2.threshold(
-        difference,
-        CR_THRESHOLD,
-        255,
-        cv2.THRESH_BINARY
-    )
-
-    return mask
-
-
-# ============================================================
-# MORPHOLOGICAL PROCESSING
-# ============================================================
-
-def morphological_processing(mask):
-    kernel = cv2.getStructuringElement(
+    # Close gaps across the projected screen.
+    close_kernel = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE,
         (
-            MORPH_KERNEL_SIZE,
-            MORPH_KERNEL_SIZE
+            RGBW_CLOSE_KERNEL,
+            RGBW_CLOSE_KERNEL
         )
     )
 
-    opened = cv2.morphologyEx(
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_CLOSE,
+        close_kernel
+    )
+
+    # Fill small holes inside the screen.
+    contours, _ = cv2.findContours(
+        mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    if not contours:
+        return mask, change_score, threshold
+
+    # Keep only sufficiently large candidates.
+    frame_area = mask.shape[0] * mask.shape[1]
+
+    candidates = []
+
+    for contour in contours:
+        area = cv2.contourArea(contour)
+
+        if area >= frame_area * RGBW_MIN_COMPONENT_RATIO:
+            candidates.append(
+                (area, contour)
+            )
+
+    if not candidates:
+        return mask, change_score, threshold
+
+    # Sort by area, but prefer a component that looks like a screen:
+    # large enough and reasonably quadrilateral.
+    candidates.sort(
+        key=lambda item: item[0],
+        reverse=True
+    )
+
+    best_contour = None
+    best_score = -1
+
+    for area, contour in candidates[:10]:
+        perimeter = cv2.arcLength(
+            contour,
+            True
+        )
+
+        if perimeter <= 0:
+            continue
+
+        polygon = cv2.approxPolyDP(
+            contour,
+            RGBW_APPROX_EPSILON * perimeter,
+            True
+        )
+
+        # A 4-corner contour gets a strong preference.
+        quad_bonus = 5.0 if len(polygon) == 4 else 0.0
+
+        score = (
+            area / frame_area +
+            quad_bonus
+        )
+
+        if score > best_score:
+            best_score = score
+            best_contour = contour
+
+    if best_contour is None:
+        best_contour = candidates[0][1]
+
+    final_mask = np.zeros_like(mask)
+
+    cv2.drawContours(
+        final_mask,
+        [best_contour],
+        -1,
+        255,
+        -1
+    )
+
+    return final_mask, change_score, threshold
+
+
+def clean_mask(mask):
+    """Clean binary calibration masks."""
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (MORPH_KERNEL_SIZE, MORPH_KERNEL_SIZE)
+    )
+
+    mask = cv2.morphologyEx(
         mask,
         cv2.MORPH_OPEN,
         kernel
     )
 
-    closed = cv2.morphologyEx(
-        opened,
+    mask = cv2.morphologyEx(
+        mask,
         cv2.MORPH_CLOSE,
         kernel
     )
 
-    return closed
+    return mask
 
 
-# ============================================================
-# COMBINE RGB MASKS
-# ============================================================
+def find_screen_corners(mask):
+    """
+    Find a quadrilateral screen from the final RGBW mask.
 
-def combine_masks(
-    red_mask,
-    green_mask,
-    blue_mask
-):
-    combined = cv2.bitwise_or(
-        red_mask,
-        green_mask
-    )
-
-    combined = cv2.bitwise_or(
-        combined,
-        blue_mask
-    )
-
-    return combined
-
-
-# ============================================================
-# FIND LARGEST CONTOUR
-# ============================================================
-
-def find_largest_contour(mask):
+    We strongly prefer a true 4-point contour. If the contour is not
+    exactly four points, we use a convex hull and try again. We do NOT
+    silently use a giant minimum-area rectangle, because that was the
+    reason the previous calibration produced a terrible rectangle
+    around the room.
+    """
     contours, _ = cv2.findContours(
         mask,
         cv2.RETR_EXTERNAL,
@@ -498,53 +498,105 @@ def find_largest_contour(mask):
     if not contours:
         return None
 
-    return max(
+    frame_area = mask.shape[0] * mask.shape[1]
+
+    contours = sorted(
         contours,
-        key=cv2.contourArea
+        key=cv2.contourArea,
+        reverse=True
     )
 
+    for contour in contours[:10]:
+        area = cv2.contourArea(contour)
 
-# ============================================================
-# CONTOUR APPROXIMATION
-# ============================================================
+        if area < frame_area * MIN_SCREEN_AREA_RATIO:
+            continue
 
-def approximate_contour(contour):
-    perimeter = cv2.arcLength(
-        contour,
-        True
-    )
+        perimeter = cv2.arcLength(
+            contour,
+            True
+        )
 
-    epsilon = (
-        APPROX_EPSILON_RATIO *
-        perimeter
-    )
+        for epsilon_ratio in [
+            0.005,
+            0.01,
+            0.015,
+            0.02,
+            0.03,
+            0.04
+        ]:
+            polygon = cv2.approxPolyDP(
+                contour,
+                epsilon_ratio * perimeter,
+                True
+            )
 
-    return cv2.approxPolyDP(
-        contour,
-        epsilon,
-        True
-    )
+            if len(polygon) == 4:
+                points = polygon.reshape(
+                    4,
+                    2
+                ).astype(np.float32)
 
+                # Reject a calibration rectangle whose corners are
+                # outside the actual camera frame.
+                h, w = mask.shape[:2]
 
-# ============================================================
-# ORDER FOUR CORNERS
-#
-# 0 = Top Left
-# 1 = Top Right
-# 2 = Bottom Right
-# 3 = Bottom Left
-# ============================================================
+                if np.any(points[:, 0] < 0):
+                    continue
+                if np.any(points[:, 0] >= w):
+                    continue
+                if np.any(points[:, 1] < 0):
+                    continue
+                if np.any(points[:, 1] >= h):
+                    continue
+
+                return order_corners(points)
+
+        # Try convex hull if the raw contour was fragmented.
+        hull = cv2.convexHull(contour)
+        hull_perimeter = cv2.arcLength(
+            hull,
+            True
+        )
+
+        for epsilon_ratio in [
+            0.005,
+            0.01,
+            0.02,
+            0.03,
+            0.05
+        ]:
+            polygon = cv2.approxPolyDP(
+                hull,
+                epsilon_ratio * hull_perimeter,
+                True
+            )
+
+            if len(polygon) == 4:
+                points = polygon.reshape(
+                    4,
+                    2
+                ).astype(np.float32)
+
+                h, w = mask.shape[:2]
+
+                if (
+                    np.all(points[:, 0] >= 0) and
+                    np.all(points[:, 0] < w) and
+                    np.all(points[:, 1] >= 0) and
+                    np.all(points[:, 1] < h)
+                ):
+                    return order_corners(points)
+
+    return None
+
 
 def order_corners(points):
-    points = np.array(
+    """Return TL, TR, BR, BL in that order."""
+    points = np.asarray(
         points,
         dtype=np.float32
     )
-
-    if points.shape[0] != 4:
-        raise ValueError(
-            "Exactly four points are required."
-        )
 
     ordered = np.zeros(
         (4, 2),
@@ -552,87 +604,17 @@ def order_corners(points):
     )
 
     sums = points.sum(axis=1)
+    differences = points[:, 0] - points[:, 1]
 
-    ordered[0] = points[
-        np.argmin(sums)
-    ]
-
-    ordered[2] = points[
-        np.argmax(sums)
-    ]
-
-    differences = (
-        points[:, 0] -
-        points[:, 1]
-    )
-
-    ordered[1] = points[
-        np.argmax(differences)
-    ]
-
-    ordered[3] = points[
-        np.argmin(differences)
-    ]
+    ordered[0] = points[np.argmin(sums)]
+    ordered[2] = points[np.argmax(sums)]
+    ordered[1] = points[np.argmax(differences)]
+    ordered[3] = points[np.argmin(differences)]
 
     return ordered
 
 
-# ============================================================
-# HOMOGRAPHY
-# ============================================================
-
-def calculate_homography(corners):
-    width = CAMERA_WIDTH
-    height = CAMERA_HEIGHT
-
-    destination = np.array(
-        [
-            [0, 0],
-            [width - 1, 0],
-            [width - 1, height - 1],
-            [0, height - 1]
-        ],
-        dtype=np.float32
-    )
-
-    homography, _ = cv2.findHomography(
-        corners,
-        destination,
-        cv2.RANSAC
-    )
-
-    return homography
-
-
-# ============================================================
-# APPLY HOMOGRAPHY
-# ============================================================
-
-def transform_point(
-    point,
-    homography
-):
-    point = np.array(
-        [[point]],
-        dtype=np.float32
-    )
-
-    transformed = cv2.perspectiveTransform(
-        point,
-        homography
-    )
-
-    return transformed[0][0]
-
-
-# ============================================================
-# DRAW DETECTED SCREEN
-# ============================================================
-
-def draw_corners(
-    frame,
-    corners
-):
+def draw_result(frame, corners):
     output = frame.copy()
 
     labels = [
@@ -642,32 +624,7 @@ def draw_corners(
         "BL"
     ]
 
-    for i, point in enumerate(corners):
-
-        x = int(point[0])
-        y = int(point[1])
-
-        cv2.circle(
-            output,
-            (x, y),
-            10,
-            (0, 255, 255),
-            -1
-        )
-
-        cv2.putText(
-            output,
-            labels[i],
-            (x + 15, y - 15),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0, 255, 255),
-            2
-        )
-
-    polygon = corners.astype(
-        np.int32
-    )
+    polygon = corners.astype(np.int32)
 
     cv2.polylines(
         output,
@@ -677,513 +634,163 @@ def draw_corners(
         3
     )
 
+    for label, point in zip(labels, corners):
+        x, y = map(int, point)
+
+        cv2.circle(
+            output,
+            (x, y),
+            9,
+            (0, 255, 255),
+            -1
+        )
+
+        cv2.putText(
+            output,
+            label,
+            (x + 12, y - 12),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 255),
+            2
+        )
+
     return output
 
 
-# ============================================================
-# SAVE CALIBRATION
-# ============================================================
 
-def save_calibration(
-    corners,
-    homography
-):
-    np.save(
-        "screen_corners.npy",
-        corners
-    )
 
-    np.save(
-        "homography.npy",
-        homography
-    )
+def save_calibration(corners):
+    np.save("screen_corners.npy", corners)
 
-    print()
-    print("Calibration saved:")
+    print("\nSaved:")
     print("  screen_corners.npy")
-    print("  homography.npy")
 
-
-# ============================================================
-# MAIN CALIBRATION
-# ============================================================
 
 def main():
-
-    print()
-    print("=" * 70)
-    print("SMARTIR DIGITAL NOTEBOOK")
-    print("UNIVERSAL PROJECTOR SCREEN CALIBRATION")
-    print("=" * 70)
-
     cap = None
 
     try:
-
-        # ----------------------------------------------------
-        # AUTOMATIC CAMERA DETECTION
-        # ----------------------------------------------------
+        print("\n" + "=" * 70)
+        print("SMARTIR RGBW SCREEN CALIBRATION")
+        print("RED ∩ GREEN ∩ BLUE ∩ WHITE")
+        print("=" * 70)
 
         cap = open_camera()
 
-        # ----------------------------------------------------
-        # WINDOWS
-        # ----------------------------------------------------
-
-        projector_window = (
-            create_projector_window()
-        )
+        projector_window = create_projector_window()
 
         cv2.namedWindow(
             "Camera Preview",
             cv2.WINDOW_NORMAL
         )
 
-        # ----------------------------------------------------
-        # STORAGE
-        # ----------------------------------------------------
+        captures = {}
 
-        captured_frames = {}
-        cr_channels = {}
-        masks = {}
+        for name, color in CALIBRATION_COLORS.items():
+            show_color(projector_window, color)
 
-        # ----------------------------------------------------
-        # CALIBRATION SEQUENCE
-        # ----------------------------------------------------
-
-        for color_name, color in (
-            CALIBRATION_COLORS.items()
-        ):
-
-            show_color(
-                projector_window,
-                color
-            )
-
-            confirmed = (
-                wait_for_confirmation(
-                    color_name
-                )
-            )
-
-            if not confirmed:
-                print(
-                    "Calibration cancelled."
-                )
+            if not wait_for_confirmation(name):
+                print("Calibration cancelled.")
                 return
 
-            frame = (
-                capture_average_frame(
-                    cap,
-                    AVERAGE_FRAMES
-                )
+            captures[name] = capture_average_frame(cap)
+
+            cv2.imshow(
+                "Camera Preview",
+                captures[name]
             )
+            cv2.waitKey(300)
 
-            captured_frames[
-                color_name
-            ] = frame
+            print(f"{name} capture complete.")
 
-            ycrcb = (
-                convert_to_ycrcb(
-                    frame
-                )
-            )
-
-            cr = extract_cr(
-                ycrcb
-            )
-
-            cr_channels[
-                color_name
-            ] = cr
-
-            print(
-                f"{color_name} "
-                "calibration captured."
-            )
-
-        # ----------------------------------------------------
-        # WHITE REFERENCE
-        # ----------------------------------------------------
-
-        white_cr = (
-            cr_channels["WHITE"]
+        print("\nBuilding RGBW screen-change mask...")
+        print(
+            "Detecting pixels whose colour changes across "
+            "RED -> GREEN -> BLUE -> WHITE."
         )
 
-        # ----------------------------------------------------
-        # COLOR DIFFERENCES
-        # ----------------------------------------------------
-
-        print()
-        print("=" * 60)
-        print("CALCULATING COLOR DIFFERENCES")
-        print("=" * 60)
-
-        for color_name in [
-            "RED",
-            "GREEN",
-            "BLUE"
-        ]:
-
-            difference = (
-                calculate_difference(
-                    cr_channels[color_name],
-                    white_cr
-                )
-            )
-
-            mask = (
-                threshold_difference(
-                    difference
-                )
-            )
-
-            mask = (
-                morphological_processing(
-                    mask
-                )
-            )
-
-            masks[color_name] = mask
-
-            cv2.imshow(
-                f"{color_name} Difference",
-                difference
-            )
-
-            cv2.imshow(
-                f"{color_name} Threshold",
-                mask
-            )
-
-            cv2.waitKey(500)
-
-        # ----------------------------------------------------
-        # COMBINE MASKS
-        # ----------------------------------------------------
+        intersection, change_score, change_threshold = (
+            build_rgbw_screen_mask(captures)
+        )
 
         print(
-            "Combining RGB masks..."
-        )
-
-        combined_mask = (
-            combine_masks(
-                masks["RED"],
-                masks["GREEN"],
-                masks["BLUE"]
-            )
+            f"Adaptive Lab-change threshold: "
+            f"{change_threshold:.2f}"
         )
 
         cv2.imshow(
-            "Combined RGB Mask",
-            combined_mask
+            "RGBW CHANGE MASK",
+            intersection
         )
 
-        cv2.waitKey(500)
+        # Normalize the change score for visual debugging.
+        debug_score = cv2.normalize(
+            change_score,
+            None,
+            0,
+            255,
+            cv2.NORM_MINMAX
+        ).astype(np.uint8)
 
-        # ----------------------------------------------------
-        # MORPHOLOGICAL PROCESSING
-        # ----------------------------------------------------
-
-        print(
-            "Applying morphological processing..."
-        )
-
-        processed_mask = (
-            morphological_processing(
-                combined_mask
-            )
+        cv2.imshow(
+            "RGBW CHANGE SCORE",
+            debug_score
         )
 
         cv2.imshow(
-            "Morphological Mask",
-            processed_mask
+            "FINAL SCREEN INTERSECTION",
+            intersection
         )
-
         cv2.waitKey(500)
 
-        # ----------------------------------------------------
-        # FIND CONTOUR
-        # ----------------------------------------------------
+        corners = find_screen_corners(intersection)
 
-        print(
-            "Finding contours..."
-        )
-
-        contour = (
-            find_largest_contour(
-                processed_mask
+        if corners is None:
+            raise RuntimeError(
+                "No screen was found in the RGBW intersection."
             )
-        )
 
-        if contour is None:
-            print()
+        print("\nDetected corners:")
+        names = ["TOP LEFT", "TOP RIGHT", "BOTTOM RIGHT", "BOTTOM LEFT"]
+
+        for name, point in zip(names, corners):
             print(
-                "ERROR: No screen contour detected."
-            )
-            print(
-                "Try reducing CR_THRESHOLD."
-            )
-            return
-
-        # ----------------------------------------------------
-        # AREA CHECK
-        # ----------------------------------------------------
-
-        area = cv2.contourArea(
-            contour
-        )
-
-        image_area = (
-            CAMERA_WIDTH *
-            CAMERA_HEIGHT
-        )
-
-        area_ratio = (
-            area / image_area
-        )
-
-        print(
-            f"Detected contour area: "
-            f"{area_ratio * 100:.2f}%"
-        )
-
-        if (
-            area_ratio <
-            MIN_SCREEN_AREA_RATIO
-        ):
-            print()
-            print(
-                "ERROR: Detected region "
-                "is too small."
-            )
-            print(
-                "Lower CR_THRESHOLD or "
-                "improve projector/camera "
-                "conditions."
-            )
-            return
-
-        # ----------------------------------------------------
-        # APPROXIMATE CONTOUR
-        # ----------------------------------------------------
-
-        print(
-            "Approximating contour..."
-        )
-
-        polygon = (
-            approximate_contour(
-                contour
-            )
-        )
-
-        print(
-            f"Polygon vertices detected: "
-            f"{len(polygon)}"
-        )
-
-        # ----------------------------------------------------
-        # FOUR CORNERS
-        # ----------------------------------------------------
-
-        if len(polygon) == 4:
-
-            corners = (
-                polygon
-                .reshape(4, 2)
-                .astype(np.float32)
+                f"{name:<14}: "
+                f"({point[0]:.1f}, {point[1]:.1f})"
             )
 
-        else:
-
-            print(
-                "Contour did not produce "
-                "exactly four corners."
-            )
-
-            print(
-                "Using minimum-area rectangle..."
-            )
-
-            rectangle = (
-                cv2.minAreaRect(
-                    contour
-                )
-            )
-
-            corners = (
-                cv2.boxPoints(
-                    rectangle
-                ).astype(np.float32)
-            )
-
-        # ----------------------------------------------------
-        # ORDER CORNERS
-        # ----------------------------------------------------
-
-        corners = order_corners(
-            corners
-        )
-
-        # ----------------------------------------------------
-        # PRINT CORNERS
-        # ----------------------------------------------------
-
-        print()
-        print("=" * 60)
-        print("DETECTED SCREEN CORNERS")
-        print("=" * 60)
-
-        print(
-            f"TOP LEFT     : "
-            f"({corners[0][0]:.2f}, "
-            f"{corners[0][1]:.2f})"
-        )
-
-        print(
-            f"TOP RIGHT    : "
-            f"({corners[1][0]:.2f}, "
-            f"{corners[1][1]:.2f})"
-        )
-
-        print(
-            f"BOTTOM RIGHT : "
-            f"({corners[2][0]:.2f}, "
-            f"{corners[2][1]:.2f})"
-        )
-
-        print(
-            f"BOTTOM LEFT  : "
-            f"({corners[3][0]:.2f}, "
-            f"{corners[3][1]:.2f})"
-        )
-
-        # ----------------------------------------------------
-        # HOMOGRAPHY
-        # ----------------------------------------------------
-
-        print()
-        print(
-            "Calculating homography..."
-        )
-
-        homography = (
-            calculate_homography(
-                corners
-            )
-        )
-
-        if homography is None:
-            print(
-                "ERROR: Homography "
-                "calculation failed."
-            )
-            return
-
-        print()
-        print(
-            "HOMOGRAPHY MATRIX:"
-        )
-        print(homography)
-
-        # ----------------------------------------------------
-        # DRAW RESULT
-        # ----------------------------------------------------
-
-        white_frame = (
-            captured_frames["WHITE"]
-        )
-
-        result = draw_corners(
-            white_frame,
+        result = draw_result(
+            captures["WHITE"],
             corners
         )
 
         cv2.imshow(
-            "FINAL SCREEN CALIBRATION",
+            "FINAL CALIBRATION",
             result
         )
 
-        # ----------------------------------------------------
-        # SAVE
-        # ----------------------------------------------------
+        save_calibration(corners)
 
-        save_calibration(
-            corners,
-            homography
-        )
-
-        # ----------------------------------------------------
-        # TEST HOMOGRAPHY
-        # ----------------------------------------------------
-
-        print()
-        print("=" * 60)
-        print("HOMOGRAPHY TEST")
-        print("=" * 60)
-
-        test_points = [
-            ("TOP LEFT", corners[0]),
-            ("TOP RIGHT", corners[1]),
-            ("BOTTOM RIGHT", corners[2]),
-            ("BOTTOM LEFT", corners[3])
-        ]
-
-        for name, point in test_points:
-
-            transformed = (
-                transform_point(
-                    point,
-                    homography
-                )
-            )
-
-            print(
-                f"{name}: "
-                f"camera=({point[0]:.1f}, "
-                f"{point[1]:.1f}) "
-                f"-> "
-                f"screen=({transformed[0]:.1f}, "
-                f"{transformed[1]:.1f})"
-            )
-
-        print()
-        print("=" * 60)
-        print("CALIBRATION COMPLETE")
-        print("=" * 60)
-
-        print()
-        print(
-            "Press any key in an OpenCV "
-            "window to exit."
-        )
+        print("\nCalibration complete.")
+        print("Press any key in an OpenCV window to finish.")
 
         cv2.waitKey(0)
 
     except KeyboardInterrupt:
-        print(
-            "\nCalibration interrupted."
-        )
+        print("\nCalibration interrupted.")
 
-    except Exception as e:
-        print()
-        print(
-            "ERROR:",
-            repr(e)
-        )
+    except Exception as error:
+        print("\nCALIBRATION ERROR:")
+        print(error)
+        sys.exit(1)
 
     finally:
-
         if cap is not None:
             cap.release()
 
         cv2.destroyAllWindows()
 
-
-# ============================================================
-# PROGRAM START
-# ============================================================
 
 if __name__ == "__main__":
     main()
