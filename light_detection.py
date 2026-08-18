@@ -1,3 +1,4 @@
+import os
 import platform
 import sys
 import time
@@ -66,6 +67,19 @@ def resolve_mode(mode):
 def open_camera(mode="visible"):
     resolved_mode = resolve_mode(mode)
     print(f"\nSearching for detection camera (Mode: {resolved_mode})...")
+
+    # Check if a custom IP camera URL or specific index is provided via environment variable
+    custom_cam = os.environ.get("SMARTIR_CAM")
+    if custom_cam:
+        print(f"Using custom camera source from SMARTIR_CAM: {custom_cam}")
+        source = int(custom_cam) if custom_cam.isdigit() else custom_cam
+        camera = cv2.VideoCapture(source)
+        if camera.isOpened():
+            camera.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+            camera.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+            return camera
+        else:
+            print("Warning: Could not open custom camera source. Falling back to auto-scan.")
 
     for index in range(MAX_CAMERA_INDEX):
         for backend in get_backends():

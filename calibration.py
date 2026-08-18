@@ -1,3 +1,4 @@
+import os
 import platform
 import sys
 import time
@@ -152,6 +153,20 @@ def open_camera():
     print("\n" + "=" * 60)
     print("AUTOMATIC CAMERA DETECTION")
     print("=" * 60)
+
+    # Check if a custom IP camera URL or specific index is provided via environment variable
+    custom_cam = os.environ.get("SMARTIR_CAM")
+    if custom_cam:
+        print(f"Using custom camera source from SMARTIR_CAM: {custom_cam}")
+        # If it's a digit, convert to int index, otherwise treat as network stream URL
+        source = int(custom_cam) if custom_cam.isdigit() else custom_cam
+        cap = cv2.VideoCapture(source)
+        if cap.isOpened():
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+            return cap
+        else:
+            print("Warning: Could not open custom camera source. Falling back to auto-scan.")
 
     for index in range(MAX_CAMERA_INDEX):
         for backend in get_camera_backends():
