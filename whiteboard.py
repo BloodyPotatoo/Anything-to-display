@@ -49,7 +49,7 @@ MIN_MOVEMENT = 1.0
 
 # The detector can be left in visible mode while testing with a normal
 # webcam. "ir" and "auto" are labels for the eventual IR detector.
-DEFAULT_MODE = "visible"
+DEFAULT_MODE = "auto"
 
 SAVE_FILE = "whiteboard.png"
 
@@ -214,6 +214,7 @@ def make_debug_frame(
     screen_mask,
     result,
     detection_mask,
+    mode,
 ):
     """
     Optional camera debug view.
@@ -347,7 +348,7 @@ def main():
         # CAMERA
         # ----------------------------------------------------
 
-        camera = open_camera()
+        camera = open_camera(mode)
 
         # Build the screen mask from the EXISTING calibration.
         screen_mask = make_screen_mask(
@@ -417,6 +418,7 @@ def main():
             result, detection_mask = find_light(
                 screen_mask,
                 frame,
+                mode,
             )
 
             # ------------------------------------------------
@@ -490,6 +492,7 @@ def main():
                     screen_mask,
                     result,
                     detection_mask,
+                    mode,
                 )
 
             # waitKey(1) keeps the fullscreen app responsive.

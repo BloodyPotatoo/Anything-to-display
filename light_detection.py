@@ -16,9 +16,10 @@ from coordinate_mapper import CoordinateMapper
 #   4. Finds the center of the brightest suitable blob.
 #   5. Converts camera coordinates -> desktop coordinates.
 #
-# Optimized for Raspberry Pi 4 + Arducam NoIR:
-#   - Uses Grayscale thresholding directly (skips expensive HSV conversion).
-#   - Attempts manual low exposure to filter out ambient room glare.
+# Optimized for Raspberry Pi 4 + Arducam NoIR & PC Testing:
+#   - "visible" mode: Auto-exposure, lower threshold (200) for webcams/flashlights.
+#   - "ir" mode: Manual low exposure, high threshold (240) for IR tracking.
+#   - "auto" mode: Automatically selects "ir" on Linux/Pi and "visible" on PC.
 # ============================================================
 
 CAMERA_WIDTH = 1280
@@ -26,10 +27,7 @@ CAMERA_HEIGHT = 720
 CAMERA_FPS = 30
 MAX_CAMERA_INDEX = 10
 
-# High threshold to isolate the bright IR LED spot from ambient light.
-BRIGHTNESS_THRESHOLD = 240
 KERNEL_SIZE = 5
-
 MIN_AREA = 3
 MAX_AREA = 3000
 
@@ -52,8 +50,22 @@ def get_backends():
     return [cv2.CAP_ANY]
 
 
-def open_camera():
-    print("\nSearching for detection camera...")
+def resolve_mode(mode):
+    """Automatically resolve 'auto' mode based on the operating system."""
+    if mode == "auto":
+        system = platform.system()
+        if system == "Linux":
+            print("Auto-detected Linux/Raspberry Pi: Selecting 'ir' mode.")
+            return "ir"
+        else:
+            print(f"Auto-detected {system} PC: Selecting 'visible' mode.")
+            return "visible"
+    return mode
+
+
+def open_camera(mode="visible"):
+    resolved_mode = resolve_mode(mode)
+    print(f"\nSearching for detection camera (Mode: {resolved_mode})...")
 
     for index in range(MAX_CAMERA_INDEX):
         for backend in get_backends():
@@ -93,13 +105,23 @@ def open_camera():
             except Exception:
                 pass
 
-            # Optimize exposure for IR tracking:
-            # Lower exposure darkens the background, leaving only the bright IR LED.
-            try:
-                camera.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)  # 1 = Manual Mode
-                camera.set(cv2.CAP_PROP_EXPOSURE, 10)      # Very low exposure value
-            except Exception:
-                pass
+            # Apply exposure settings based on the resolved mode
+            if resolved_mode == "ir":
+                # Optimize exposure for IR tracking:
+                # Lower exposure darkens the background, leaving only the bright IR LED.
+                try:
+                    camera.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)  # 1 = Manual Mode
+                    camera.set(cv2.CAP_PROP_EXPOSURE, 10)      # Very low exposure value
+                    print("Applied manual low exposure settings for IR tracking.")
+                except Exception:
+                    pass
+            else:
+                # For visible mode, ensure auto-exposure is enabled for standard webcams
+                try:
+                    camera.set(cv2.CAP_PROP_AUTO_EXPOSURE, 3)  # 3 = Auto Mode
+                    print("Applied auto-exposure settings for visible light tracking.")
+                except Exception:
+                    pass
 
             time.sleep(0.15)
 
@@ -142,7 +164,12 @@ def make_screen_mask(frame_shape, mapper):
     return mask
 
 
-def find_light(mask, frame):
+def find_light(mask, frame, mode="visible"):
+    resolved_mode = resolve_mode(mode)
+    
+    # Use a lower threshold for visible light (e.g., flashlights) and higher for IR
+    threshold_val = 240 if resolved_mode == "ir" else 200
+
     # Convert to grayscale directly. Skipping HSV conversion saves massive CPU on Pi 4.
     gray = cv2.cvtColor(
         frame,
@@ -151,7 +178,7 @@ def find_light(mask, frame):
 
     _, bright_mask = cv2.threshold(
         gray,
-        BRIGHTNESS_THRESHOLD,
+        threshold_val,
         255,
         cv2.THRESH_BINARY
     )
@@ -231,11 +258,11 @@ def find_light(mask, frame):
     return (x, y, best), bright_mask
 
 
-def run_light_detection(mapper):
+def run_light_detection(mapper, mode="visible"):
     camera = None
 
     try:
-        camera = open_camera()
+        camera = open_camera(mode)
 
         screen_mask = None
 
@@ -260,7 +287,8 @@ def run_light_detection(mapper):
 
             result, detection_mask = find_light(
                 screen_mask,
-                frame
+                frame,
+                mode
             )
 
             display = frame.copy()
@@ -363,7 +391,13 @@ def main():
         mapper = CoordinateMapper()
         mapper.print_info()
 
-        run_light_detection(mapper)
+        mode = "visible"
+        if len(sys.argv) > 1:
+            mode = sys.argv[1].lower()
+            if mode not in ("visible", "ir", "auto"):
+                mode = "visible"
+
+        run_light_detection(mapper, mode)
 
     except Exception as error:
         print("\nERROR:")
