@@ -1,8 +1,8 @@
+import platform
+import sys
+import time
 import cv2
 import numpy as np
-import platform
-import time
-import sys
 
 # ============================================================
 # SMARTIR - RGBW SCREEN CALIBRATION

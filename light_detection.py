@@ -1,9 +1,8 @@
+import platform
+import sys
+import time
 import cv2
 import numpy as np
-import os
-import sys
-import platform
-import time
 
 from coordinate_mapper import CoordinateMapper
 
@@ -17,8 +16,9 @@ from coordinate_mapper import CoordinateMapper
 #   4. Finds the center of the brightest suitable blob.
 #   5. Converts camera coordinates -> desktop coordinates.
 #
-# With a normal webcam this detects bright visible/IR light.
-# With an IR-sensitive camera it can be used for the actual IR pen.
+# Optimized for Raspberry Pi 4 + Arducam NoIR:
+#   - Uses Grayscale thresholding directly (skips expensive HSV conversion).
+#   - Attempts manual low exposure to filter out ambient room glare.
 # ============================================================
 
 CAMERA_WIDTH = 1280
@@ -26,7 +26,8 @@ CAMERA_HEIGHT = 720
 CAMERA_FPS = 30
 MAX_CAMERA_INDEX = 10
 
-BRIGHTNESS_THRESHOLD = 200
+# High threshold to isolate the bright IR LED spot from ambient light.
+BRIGHTNESS_THRESHOLD = 240
 KERNEL_SIZE = 5
 
 MIN_AREA = 3
@@ -92,6 +93,14 @@ def open_camera():
             except Exception:
                 pass
 
+            # Optimize exposure for IR tracking:
+            # Lower exposure darkens the background, leaving only the bright IR LED.
+            try:
+                camera.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)  # 1 = Manual Mode
+                camera.set(cv2.CAP_PROP_EXPOSURE, 10)      # Very low exposure value
+            except Exception:
+                pass
+
             time.sleep(0.15)
 
             ret, frame = camera.read()
@@ -134,35 +143,17 @@ def make_screen_mask(frame_shape, mapper):
 
 
 def find_light(mask, frame):
+    # Convert to grayscale directly. Skipping HSV conversion saves massive CPU on Pi 4.
     gray = cv2.cvtColor(
         frame,
         cv2.COLOR_BGR2GRAY
     )
 
-    hsv = cv2.cvtColor(
-        frame,
-        cv2.COLOR_BGR2HSV
-    )
-
-    value = hsv[:, :, 2]
-
-    _, gray_mask = cv2.threshold(
+    _, bright_mask = cv2.threshold(
         gray,
         BRIGHTNESS_THRESHOLD,
         255,
         cv2.THRESH_BINARY
-    )
-
-    _, value_mask = cv2.threshold(
-        value,
-        BRIGHTNESS_THRESHOLD,
-        255,
-        cv2.THRESH_BINARY
-    )
-
-    bright_mask = cv2.bitwise_and(
-        gray_mask,
-        value_mask
     )
 
     # IMPORTANT:
@@ -216,7 +207,7 @@ def find_light(mask, frame):
         )
 
         mean_value = cv2.mean(
-            value,
+            gray,
             mask=contour_mask
         )[0]
 

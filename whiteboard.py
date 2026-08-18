@@ -9,15 +9,6 @@ from light_detection import open_camera, make_screen_mask, find_light
 # ============================================================
 # SMARTIR - REAL-TIME DIGITAL WHITEBOARD
 #
-# This file is intentionally standalone.
-#
-# Existing working files are NOT modified:
-#   calibration.py
-#   coordinate_mapper.py
-#   light_detection.py
-#   main.py
-#   screen_corners.npy
-#
 # Pipeline:
 #
 #   CAMERA
@@ -348,13 +339,6 @@ def main():
         mode = DEFAULT_MODE
 
     print(f"\nDetection mode: {mode}")
-
-    if mode != "visible":
-        print(
-            "NOTE: The current detector is still brightness-based. "
-            "A real IR mode will be added when the IR-capable camera/"
-            "pen hardware is available."
-        )
 
     camera = None
 
