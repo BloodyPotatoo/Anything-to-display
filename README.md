@@ -1,9 +1,8 @@
-# SMARTIR - Wii Remote Style Digital Whiteboard
+# 🖥️ SMARTIR - Interactive Digital Whiteboard System
 
-This project imitates the basic idea behind Johnny Chung Lee's Wii Remote
-interactive whiteboard, but uses your own camera/light hardware.
+An advanced, hardware-agnostic digital whiteboard system that emulates optical tracking solutions using standard camera and light-emitting hardware.
 
-The current software has three main stages:
+The software processes input through a multi-stage pipeline to map physical light coordinates to desktop coordinates:
 
 ```text
 RGBW PROJECTOR CALIBRATION
@@ -27,46 +26,55 @@ CAMERA COORDINATE
 DESKTOP COORDINATE
 ```
 
-## Files
+---
 
-- `main.py` - runs the complete system.
-- `calibration.py` - finds the projected screen using RGBW intersection.
-- `coordinate_mapper.py` - converts camera coordinates to desktop coordinates.
-- `light_detection.py` - detects IR/bright light only inside the calibrated screen.
-- `screen_corners.npy` - generated after successful calibration.
+## 📦 System Components
 
-## Install
+*   `main.py` — Main entry point to run the complete system.
+*   `calibration.py` — Detects and isolates the projected screen area using RGBW intersection.
+*   `coordinate_mapper.py` — Computes homography to map camera coordinates to desktop coordinates.
+*   `light_detection.py` — Detects infrared or bright light sources strictly within the calibrated screen boundary.
+*   `screen_corners.npy` — Calibration output file containing the detected screen corner coordinates.
+
+---
+
+## 🚀 Installation
+
+Install the required dependencies using `pip`:
 
 ```bash
 pip install opencv-python numpy
 ```
 
-On some Linux systems, tkinter may also be needed for desktop-size detection.
+*Note: On certain Linux distributions, `tkinter` may also be required for desktop resolution detection.*
 
-## Run
+---
 
-Run only:
+## 💻 Usage
+
+To launch the application, execute the main script:
 
 ```bash
 python main.py
 ```
 
-The program will ask whether to calibrate.
+The system will prompt you to initiate the calibration sequence.
 
-## Calibration procedure
+---
 
-The projector displays:
+## 📐 Calibration Procedure
 
-1. RED
-2. GREEN
-3. BLUE
-4. WHITE
+The calibration process maps the projection area by sequentially displaying four solid colors:
 
-Press ENTER in the terminal after each color is correctly projected.
+1.  🔴 **RED**
+2.  🟢 **GREEN**
+3.  🔵 **BLUE**
+4.  ⚪ **WHITE**
 
-The program creates four masks.
-
-The important operation is a TOLERANT intersection:
+### Step-by-Step Instructions:
+1. Project each color onto your screen.
+2. Press **ENTER** in the terminal once the color is fully visible to capture the frame.
+3. The system will automatically compute a tolerant intersection of the four masks:
 
 ```text
 RED confidence
@@ -78,29 +86,22 @@ BLUE confidence
 WHITE confidence
 ```
 
-Each pixel gets a confidence value from 0..255. The weakest of the
-four confidence values is used. A pixel is kept when that weakest
-confidence is above `INTERSECTION_THRESHOLD`.
+Each pixel is assigned a confidence value from `0` to `255`. The weakest of the four confidence values is evaluated. A pixel is retained if its weakest confidence exceeds the `INTERSECTION_THRESHOLD`.
 
-This means the camera/projector does NOT need to produce exact RGB
-values. It only needs to be sufficiently similar to the expected
-color.
+This robust approach ensures that exact RGB values are not required, making the system highly resilient to varying camera and projector characteristics.
 
-That intersection is used to find the four screen corners.
-
-The corners are saved as:
-
+The detected corners are saved to:
 ```text
 screen_corners.npy
 ```
 
-## Detection
+---
 
-After calibration, the camera continuously searches for a bright point.
+## 🔍 Light Detection
 
-The search is restricted to the calibrated screen polygon.
+Following successful calibration, the camera continuously scans for a bright point source. 
 
-For example:
+To prevent false positives, the search area is strictly restricted to the calibrated screen polygon:
 
 ```text
 +--------------------------------------+
@@ -114,108 +115,30 @@ For example:
 +--------------------------------------+
 ```
 
-Light outside the calibrated screen is ignored.
+*   **Standard Webcams:** Operates as a bright-light detector (e.g., phone flashlight).
+*   **IR-Sensitive Cameras:** Operates as a dedicated infrared pen tracker.
 
-With a normal laptop webcam, the detector behaves as a bright-light detector.
-It cannot guarantee that a bright pixel is infrared.
+---
 
-With an IR-sensitive camera, the same pipeline can be used for the real IR pen.
+## 🔄 Coordinate Conversion
 
-## Coordinate conversion
-
-Suppose the camera sees:
-
+When the camera detects a coordinate:
 ```text
 camera = (734, 421)
 ```
-
-The homography transforms it into:
-
+The homography matrix transforms it into the corresponding desktop coordinate:
 ```text
 screen = (x, y)
 ```
+This transformation is calculated dynamically using the four calibrated screen corners.
 
-The transformation is calculated from the four detected screen corners.
+---
 
-## Current hardware-testing mode
+## ⚙️ Configuration & Tuning
 
-You can test the complete software using:
+Key parameters can be adjusted in `calibration.py` to optimize performance:
 
-- laptop webcam
-- projected/displayed RGB colors
-- phone flashlight or other bright light
-- IR LED later, when the real hardware is available
-
-The light detector is deliberately not tied to an IR-only camera yet.
-
-
-## Calibration tolerance
-
-The main tuning values are in `calibration.py`:
-
-```python
-COLOR_DIFFERENCE_THRESHOLD = 12
-COLOR_DOMINANCE_THRESHOLD = 8
-INTERSECTION_THRESHOLD = 100
-```
-
-If calibration is still too strict, try:
-
-```python
-INTERSECTION_THRESHOLD = 70
-```
-
-or:
-
-```python
-INTERSECTION_THRESHOLD = 50
-```
-
-If the screen mask starts detecting too much background, increase the
-threshold again.
-
-The system still requires the RGBW intersection; it is simply using
-thresholded confidence values instead of exact pixel matches.
-
-
-## Important: spatial tolerance
-
-The RGBW calibration does NOT require the four masks to line up
-pixel-for-pixel.
-
-Real cameras can change exposure/white balance between captures, and
-the projected screen boundary can move by a few pixels. Each mask is
-therefore expanded before the intersection.
-
-Main setting:
-
-```python
-INTERSECTION_TOLERANCE_PIXELS = 25
-```
-
-For a difficult webcam/projector setup, try:
-
-```python
-INTERSECTION_TOLERANCE_PIXELS = 40
-```
-
-If the intersection becomes too large/noisy, reduce it to 15 or 10.
-
-The program also prints the percentage of the frame detected by each
-individual RED/GREEN/BLUE/WHITE mask. This makes it possible to tell
-which stage is failing.
-
-
-## Latest calibration method
-
-The calibration now uses a more robust approach for laptop webcams:
-
-1. Detect the dominant RGB channel instead of matching exact RGB values.
-2. Use adaptive thresholds based on the captured frame.
-3. Keep the largest coherent candidate region for each color.
-4. Expand each candidate region by the spatial tolerance.
-5. Intersect RED, GREEN, BLUE and WHITE.
-
-For the current webcam-testing setup the default spatial tolerance is
-100 pixels. Once the actual hardware/camera position is fixed, this can
-be reduced.
+*   `COLOR_DIFFERENCE_THRESHOLD` (Default: `3`): Minimum channel difference for color detection.
+*   `COLOR_DOMINANCE_THRESHOLD` (Default: `3`): Minimum dominance of the expected RGB channel.
+*   `INTERSECTION_THRESHOLD` (Default: `25`): Lower this value (e.g., `15` or `10`) if calibration is too strict, or increase it if background noise is detected.
+*   `INTERSECTION_TOLERANCE_PIXELS` (Default: `100`): Spatial expansion applied to each mask before intersection to account for camera movement or exposure changes.
