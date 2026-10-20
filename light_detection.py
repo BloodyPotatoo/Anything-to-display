@@ -1,198 +1,55 @@
-import glob
-import os
-import platform
 import sys
-import time
+
 import cv2
 import numpy as np
 
+from camera import open_camera, resolve_mode
 from coordinate_mapper import CoordinateMapper
 
 # ============================================================
 # SMARTIR - IR / BRIGHT LIGHT DETECTION
 #
 # The detector:
-#   1. Opens the camera.
+#   1. Opens the camera (camera.py - shared with calibration,
+#      so both always use the same resolution/mode).
 #   2. Restricts detection to the calibrated screen polygon.
-#   3. Searches for very bright light.
-#   4. Finds the center of the brightest suitable blob.
+#   3. Searches for a very bright light (the IR pen / flashlight).
+#   4. Finds the intensity-weighted center of the best blob.
 #   5. Converts camera coordinates -> desktop coordinates.
 #
-# Optimized for Raspberry Pi 4 + Arducam NoIR & PC Testing:
-#   - "visible" mode: Auto-exposure, lower threshold (200) for webcams/flashlights.
-#   - "ir" mode: Manual low exposure, high threshold (240) for IR tracking.
-#   - "auto" mode: Automatically selects "ir" on Linux/Pi and "visible" on PC.
+# Modes (resolved once, by camera.open_camera):
+#   "visible" : auto exposure, threshold 200 (webcam/flashlight tests)
+#   "ir"      : locked short exposure, threshold 240 (IR pen tracking)
+#
+# Optimized for Raspberry Pi 3B/4 + Arducam NoIR & PC testing:
+#   - grayscale only (no HSV conversion)
+#   - morphology kernel built once
+#   - per-contour statistics computed inside the contour bounding
+#     box instead of over the whole frame
 # ============================================================
-
-CAMERA_WIDTH = 1280
-CAMERA_HEIGHT = 720
-CAMERA_FPS = 30
-MAX_CAMERA_INDEX = 10
 
 KERNEL_SIZE = 5
 MIN_AREA = 3
 MAX_AREA = 3000
 
-# Ignore points too close to the screen boundary.
-SCREEN_MARGIN = 2
+# Brightness thresholds per resolved mode.
+IR_THRESHOLD = 240
+VISIBLE_THRESHOLD = 200
+
+_KERNEL = None
 
 
-def get_backends():
-    system = platform.system()
+def _get_kernel():
+    """Build the morphology kernel once (it never changes)."""
+    global _KERNEL
 
-    if system == "Windows":
-        return [cv2.CAP_DSHOW, cv2.CAP_MSMF]
+    if _KERNEL is None:
+        _KERNEL = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (KERNEL_SIZE, KERNEL_SIZE),
+        )
 
-    if system == "Darwin":
-        return [cv2.CAP_AVFOUNDATION]
-
-    if system == "Linux":
-        return [cv2.CAP_V4L2]
-
-    return [cv2.CAP_ANY]
-
-
-def get_available_indices():
-    """Find valid camera indices based on OS devices."""
-    if platform.system() == "Linux":
-        devices = sorted(glob.glob("/dev/video*"))
-        indices = []
-        for dev in devices:
-            try:
-                num = int(dev.replace("/dev/video", ""))
-                indices.append(num)
-            except ValueError:
-                pass
-        return indices if indices else [0]
-    return list(range(MAX_CAMERA_INDEX))
-
-
-def resolve_mode(mode):
-    """Automatically resolve 'auto' mode based on the operating system."""
-    if mode == "auto":
-        system = platform.system()
-        if system == "Linux":
-            print("Auto-detected Linux/Raspberry Pi: Selecting 'ir' mode.")
-            return "ir"
-        else:
-            print(f"Auto-detected {system} PC: Selecting 'visible' mode.")
-            return "visible"
-    return mode
-
-
-def try_rpi_libcamera(resolved_mode):
-    """Attempt opening Raspberry Pi camera via libcamerasrc GStreamer pipeline."""
-    if platform.system() != "Linux":
-        return None
-
-    gst_pipelines = [
-        f"libcamerasrc ! video/x-raw, width={CAMERA_WIDTH}, height={CAMERA_HEIGHT}, framerate={CAMERA_FPS}/1 ! videoconvert ! appsink drop=true",
-        "libcamerasrc ! video/x-raw, width=640, height=480 ! videoconvert ! appsink drop=true",
-    ]
-
-    for pipeline in gst_pipelines:
-        try:
-            print("Trying Raspberry Pi libcamera pipeline...")
-            cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
-            if cap.isOpened():
-                time.sleep(0.2)
-                ret, frame = cap.read()
-                if ret and frame is not None and frame.size:
-                    print("Connected successfully via libcamerasrc pipeline!")
-                    return cap
-                cap.release()
-        except Exception:
-            pass
-
-    return None
-
-
-def open_camera(mode="visible"):
-    resolved_mode = resolve_mode(mode)
-    print(f"\nSearching for detection camera on Raspberry Pi / PC (Mode: {resolved_mode})...")
-
-    # Check if a custom IP camera URL or specific index is provided via environment variable
-    custom_cam = os.environ.get("SMARTIR_CAM")
-    if custom_cam:
-        print(f"Using custom camera source from SMARTIR_CAM: {custom_cam}")
-        source = int(custom_cam) if custom_cam.isdigit() else custom_cam
-        camera = cv2.VideoCapture(source, cv2.CAP_V4L2 if platform.system() == "Linux" else cv2.CAP_ANY)
-        if camera.isOpened():
-            camera.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-            camera.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-            return camera
-        else:
-            print("Warning: Could not open custom camera source. Falling back to auto-scan.")
-
-    # Try libcamera GStreamer pipeline first if on Linux
-    if platform.system() == "Linux":
-        cap = try_rpi_libcamera(resolved_mode)
-        if cap is not None:
-            return cap
-
-    available_indices = get_available_indices()
-    for index in available_indices:
-        for backend in get_backends():
-
-            try:
-                camera = cv2.VideoCapture(
-                    index,
-                    backend
-                )
-            except Exception:
-                continue
-
-            if not camera.isOpened():
-                camera.release()
-                continue
-
-            try:
-                camera.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-                camera.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-                camera.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
-            except Exception:
-                pass
-
-            # Apply exposure settings based on the resolved mode
-            if resolved_mode == "ir":
-                try:
-                    camera.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)  # 1 = Manual Mode
-                    camera.set(cv2.CAP_PROP_EXPOSURE, 10)      # Very low exposure value
-                    print("Applied manual low exposure settings for IR tracking.")
-                except Exception:
-                    pass
-            else:
-                try:
-                    camera.set(cv2.CAP_PROP_AUTO_EXPOSURE, 3)  # 3 = Auto Mode
-                    print("Applied auto-exposure settings for visible light tracking.")
-                except Exception:
-                    pass
-
-            time.sleep(0.15)
-
-            ret, frame = camera.read()
-
-            # Retry with fallback resolution if 1280x720 allocation failed
-            if not ret or frame is None or not frame.size:
-                try:
-                    camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                    time.sleep(0.1)
-                    ret, frame = camera.read()
-                except Exception:
-                    pass
-
-            if ret and frame is not None and frame.size:
-                print(
-                    f"Camera selected: index {index}"
-                )
-                return camera
-
-            camera.release()
-
-    raise RuntimeError(
-        "Could not open a usable camera on the CSI ribbon port or USB."
-    )
+    return _KERNEL
 
 
 def make_screen_mask(frame_shape, mapper):
@@ -202,73 +59,101 @@ def make_screen_mask(frame_shape, mapper):
     """
     mask = np.zeros(
         frame_shape[:2],
-        dtype=np.uint8
+        dtype=np.uint8,
     )
 
-    polygon = mapper.camera_corners.astype(
-        np.int32
-    )
+    polygon = mapper.camera_corners.astype(np.int32)
 
     cv2.fillPoly(
         mask,
         [polygon],
-        255
+        255,
     )
 
     return mask
 
 
-def find_light(mask, frame, mode="visible"):
-    resolved_mode = resolve_mode(mode)
-    
-    # Use a lower threshold for visible light (e.g., flashlights) and higher for IR
-    threshold_val = 240 if resolved_mode == "ir" else 200
+def _contour_mean_brightness(gray, contour):
+    """
+    Mean brightness inside a contour.
 
-    # Convert to grayscale directly. Skipping HSV conversion saves massive CPU on Pi 4.
+    Computed on the contour's bounding box only, which is far
+    cheaper than building a full-frame mask for every contour
+    (this used to be the hottest part of the loop on a Pi 3B).
+    """
+    x, y, width, height = cv2.boundingRect(contour)
+
+    if width <= 0 or height <= 0:
+        return 0.0
+
+    roi = gray[y:y + height, x:x + width]
+
+    roi_mask = np.zeros((height, width), dtype=np.uint8)
+
+    shifted = contour - np.array([[[x, y]]], dtype=contour.dtype)
+
+    cv2.drawContours(
+        roi_mask,
+        [shifted],
+        -1,
+        255,
+        -1,
+    )
+
+    return cv2.mean(roi, mask=roi_mask)[0]
+
+
+def find_light(mask, frame, mode="visible"):
+    """
+    Find the pen light inside the calibrated screen polygon.
+
+    Returns ((x, y, contour), detection_mask) or (None, mask).
+    """
+    resolved_mode = resolve_mode(mode)
+
+    threshold_val = (
+        IR_THRESHOLD if resolved_mode == "ir" else VISIBLE_THRESHOLD
+    )
+
+    # Grayscale directly - skips HSV and saves CPU on the Pi.
     gray = cv2.cvtColor(
         frame,
-        cv2.COLOR_BGR2GRAY
+        cv2.COLOR_BGR2GRAY,
     )
 
     _, bright_mask = cv2.threshold(
         gray,
         threshold_val,
         255,
-        cv2.THRESH_BINARY
+        cv2.THRESH_BINARY,
     )
 
     # IMPORTANT:
     # The light is searched for ONLY inside the calibrated screen.
-    bright_mask = cv2.bitwise_and(
-        bright_mask,
-        mask
-    )
+    bright_mask = cv2.bitwise_and(bright_mask, mask)
 
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (KERNEL_SIZE, KERNEL_SIZE)
-    )
+    kernel = _get_kernel()
 
     bright_mask = cv2.morphologyEx(
         bright_mask,
         cv2.MORPH_OPEN,
-        kernel
+        kernel,
     )
 
     bright_mask = cv2.morphologyEx(
         bright_mask,
         cv2.MORPH_CLOSE,
-        kernel
+        kernel,
     )
 
     contours, _ = cv2.findContours(
         bright_mask,
         cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE
+        cv2.CHAIN_APPROX_SIMPLE,
     )
 
     best = None
-    best_score = -1
+    best_score = -1.0
 
     for contour in contours:
         area = cv2.contourArea(contour)
@@ -277,21 +162,7 @@ def find_light(mask, frame, mode="visible"):
             continue
 
         # Score using both area and brightness.
-        contour_mask = np.zeros_like(gray)
-
-        cv2.drawContours(
-            contour_mask,
-            [contour],
-            -1,
-            255,
-            -1
-        )
-
-        mean_value = cv2.mean(
-            gray,
-            mask=contour_mask
-        )[0]
-
+        mean_value = _contour_mean_brightness(gray, contour)
         score = area * mean_value
 
         if score > best_score:
@@ -316,12 +187,13 @@ def run_light_detection(mapper, mode="visible"):
     camera = None
 
     try:
-        camera = open_camera(mode)
+        camera, resolved_mode = open_camera(mode)
 
         screen_mask = None
 
         print("\n" + "=" * 65)
         print("SMARTIR LIGHT / IR DETECTION")
+        print(f"Mode: {resolved_mode}")
         print("Only the calibrated screen region is searched.")
         print("Press Q to quit.")
         print("=" * 65)
@@ -334,30 +206,35 @@ def run_light_detection(mapper, mode="visible"):
                 break
 
             if screen_mask is None or screen_mask.shape != frame.shape[:2]:
+                # Keep the mask in the same coordinate space as the
+                # calibration, whatever size the camera delivers.
+                mapper.set_frame_size(
+                    frame.shape[1],
+                    frame.shape[0],
+                )
+
                 screen_mask = make_screen_mask(
                     frame.shape,
-                    mapper
+                    mapper,
                 )
 
             result, detection_mask = find_light(
                 screen_mask,
                 frame,
-                mode
+                resolved_mode,
             )
 
             display = frame.copy()
 
             # Draw the calibrated screen boundary.
-            corners = mapper.camera_corners.astype(
-                np.int32
-            )
+            corners = mapper.camera_corners.astype(np.int32)
 
             cv2.polylines(
                 display,
                 [corners],
                 True,
                 (0, 255, 0),
-                2
+                2,
             )
 
             if result is not None:
@@ -365,7 +242,7 @@ def run_light_detection(mapper, mode="visible"):
 
                 screen_x, screen_y = mapper.camera_to_screen(
                     camera_x,
-                    camera_y
+                    camera_y,
                 )
 
                 cv2.drawContours(
@@ -373,7 +250,7 @@ def run_light_detection(mapper, mode="visible"):
                     [contour],
                     -1,
                     (255, 0, 255),
-                    2
+                    2,
                 )
 
                 cv2.circle(
@@ -381,7 +258,7 @@ def run_light_detection(mapper, mode="visible"):
                     (int(camera_x), int(camera_y)),
                     8,
                     (0, 0, 255),
-                    -1
+                    -1,
                 )
 
                 cv2.putText(
@@ -392,7 +269,7 @@ def run_light_detection(mapper, mode="visible"):
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.7,
                     (0, 255, 0),
-                    2
+                    2,
                 )
 
                 cv2.putText(
@@ -403,26 +280,25 @@ def run_light_detection(mapper, mode="visible"):
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.7,
                     (0, 255, 0),
-                    2
+                    2,
                 )
 
                 print(
                     f"\rCamera: "
                     f"({camera_x:.1f}, {camera_y:.1f})   "
-                    f"Screen: "
-                    f"({screen_x:.1f}, {screen_y:.1f})",
+                    f"Screen: ({screen_x:.1f}, {screen_y:.1f})",
                     end="",
-                    flush=True
+                    flush=True,
                 )
 
             cv2.imshow(
                 "SMARTIR Light Detection",
-                display
+                display,
             )
 
             cv2.imshow(
                 "Detection Mask - Screen Only",
-                detection_mask
+                detection_mask,
             )
 
             if (cv2.waitKey(1) & 0xFF) == ord("q"):
@@ -445,9 +321,11 @@ def main():
         mapper = CoordinateMapper()
         mapper.print_info()
 
-        mode = "visible"
+        mode = "auto"
+
         if len(sys.argv) > 1:
             mode = sys.argv[1].lower()
+
             if mode not in ("visible", "ir", "auto"):
                 mode = "visible"
 

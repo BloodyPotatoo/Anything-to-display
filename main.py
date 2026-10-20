@@ -3,6 +3,11 @@ import sys
 
 
 CALIBRATION_FILE = "screen_corners.npy"
+HOMOGRAPHY_FILE = "calibration.npz"
+
+
+def calibration_exists():
+    return os.path.exists(CALIBRATION_FILE) or os.path.exists(HOMOGRAPHY_FILE)
 
 
 def run_calibration():
@@ -26,9 +31,9 @@ def main():
     # STEP 1: Make sure screen calibration exists
     # --------------------------------------------------------
 
-    if not os.path.exists(CALIBRATION_FILE):
+    if not calibration_exists():
         print("\nNo calibration data found.")
-        print("RGBW screen calibration is required.")
+        print("Screen calibration is required (RGBW + point grid).")
 
         choice = input(
             "Run calibration now? [Y/N]: "
@@ -43,7 +48,7 @@ def main():
     else:
         print(
             "\nExisting calibration found:"
-            f" {CALIBRATION_FILE}"
+            f" {HOMOGRAPHY_FILE if os.path.exists(HOMOGRAPHY_FILE) else CALIBRATION_FILE}"
         )
 
         choice = input(
@@ -57,10 +62,10 @@ def main():
     # STEP 2: Verify calibration
     # --------------------------------------------------------
 
-    if not os.path.exists(CALIBRATION_FILE):
+    if not calibration_exists():
         print(
             "\nERROR: Calibration did not produce "
-            f"{CALIBRATION_FILE}."
+            f"{CALIBRATION_FILE} / {HOMOGRAPHY_FILE}."
         )
         return
 

@@ -2,8 +2,9 @@ import os
 import cv2
 import numpy as np
 
+from camera import open_camera
 from coordinate_mapper import CoordinateMapper
-from light_detection import open_camera, make_screen_mask, find_light
+from light_detection import make_screen_mask, find_light
 
 
 # ============================================================
@@ -301,9 +302,13 @@ def main():
     print("SMARTIR - REAL-TIME DIGITAL WHITEBOARD")
     print("=" * 70)
 
-    if not os.path.exists("screen_corners.npy"):
+    has_legacy = os.path.exists("screen_corners.npy")
+    has_new = os.path.exists("calibration.npz")
+
+    if not (has_legacy or has_new):
         raise FileNotFoundError(
-            "screen_corners.npy was not found.\n"
+            "No calibration data found (screen_corners.npy / "
+            "calibration.npz).\n"
             "Run your working calibration first."
         )
 
@@ -348,20 +353,13 @@ def main():
         # CAMERA
         # ----------------------------------------------------
 
-        camera = open_camera(mode)
+        # open_camera() also returns the RESOLVED mode, so the
+        # status bar and the detector agree on visible/ir.
+        camera, mode = open_camera(mode)
 
-        # Build the screen mask from the EXISTING calibration.
-        screen_mask = make_screen_mask(
-            (
-                int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT)),
-                int(camera.get(cv2.CAP_PROP_FRAME_WIDTH)),
-                3,
-            ),
-            mapper,
-        )
-
-        # If the camera backend reports invalid dimensions, rebuild
-        # the mask after receiving the first frame.
+        # The screen mask is built after the first real frame
+        # arrives (see inside the loop), so it always matches the
+        # actual camera resolution.
         screen_mask = None
 
         canvas = create_canvas(
@@ -401,11 +399,18 @@ def main():
                 break
 
             # Rebuild screen mask if the actual camera frame size
-            # differs from the previous frame.
+            # differs from the previous frame. set_frame_size()
+            # rescales the calibration homography into the same
+            # coordinate space as this frame.
             if (
                 screen_mask is None
                 or screen_mask.shape != frame.shape[:2]
             ):
+                mapper.set_frame_size(
+                    frame.shape[1],
+                    frame.shape[0],
+                )
+
                 screen_mask = make_screen_mask(
                     frame.shape,
                     mapper,

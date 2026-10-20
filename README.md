@@ -1,221 +1,226 @@
 # SMARTIR - Wii Remote Style Digital Whiteboard
 
-This project imitates the basic idea behind Johnny Chung Lee's Wii Remote
-interactive whiteboard, but uses your own camera/light hardware.
+This project imitates Johnny Chung Lee's Wii Remote interactive
+whiteboard: a camera tracks a bright light pen on a projected screen,
+a homography converts camera coordinates into desktop coordinates,
+and the desktop coordinates are drawn onto a canvas.
 
-The current software has three main stages:
+It runs on a PC (webcam testing) and on a Raspberry Pi with a camera
+on the default ribbon (CSI) port.
 
 ```text
-RGBW PROJECTOR CALIBRATION
-        |
-        v
-RED ∩ GREEN ∩ BLUE ∩ WHITE
-        |
-        v
-SCREEN CORNERS
-        |
-        v
-HOMOGRAPHY / COORDINATE MAPPING
-        |
-        v
-IR / BRIGHT LIGHT DETECTION
-        |
-        v
-CAMERA COORDINATE
-        |
-        v
-DESKTOP COORDINATE
+CALIBRATION
+  STEP 1: RED -> GREEN -> BLUE -> WHITE color-change
+          -> screen mask + approximate corners
+  STEP 2: 9 reference points projected one at a time
+          -> measured in camera space
+          -> RANSAC homography + error report
+          -> screen_corners.npy + calibration.npz
+DETECTION
+  camera frame -> screen polygon mask -> bright blob -> centroid
+          -> homography -> desktop coordinate -> drawn segment
 ```
 
 ## Files
 
-- `main.py` - runs the complete system.
-- `calibration.py` - finds the projected screen using RGBW intersection.
-- `coordinate_mapper.py` - converts camera coordinates to desktop coordinates.
-- `light_detection.py` - detects IR/bright light only inside the calibrated screen.
-- `screen_corners.npy` - generated after successful calibration.
+| File | Purpose |
+|------|---------|
+| `main.py` | entry point: calibrate (if needed) then start the whiteboard |
+| `camera.py` | shared camera layer: CSI/picamera2, GStreamer, V4L2, exposure modes |
+| `calibration.py` | screen detection (RGBW) + point-grid homography calibration |
+| `coordinate_mapper.py` | camera -> desktop homography, screen-size detection |
+| `light_detection.py` | bright/IR light detector (standalone test view) |
+| `whiteboard.py` | the drawing application |
+| `screen_corners.npy` | generated: screen polygon in camera space |
+| `calibration.npz` | generated: homography, points, frame size, screen size |
 
 ## Install
+
+PC:
 
 ```bash
 pip install opencv-python numpy
 ```
 
-On some Linux systems, tkinter may also be needed for desktop-size detection.
+Raspberry Pi (use the distro packages - they match the camera stack):
+
+```bash
+sudo apt update
+sudo apt install python3-picamera2 python3-opencv python3-numpy python3-tk
+sudo raspi-config   # Interface Options -> Camera -> enable
+```
+
+On a Pi the camera on the ribbon port is opened through
+**picamera2 (libcamera)** automatically. If `python3-picamera2` is
+missing, SMARTIR falls back to a `libcamerasrc` GStreamer pipeline,
+then to scanning `/dev/video*`.
 
 ## Run
 
-Run only:
-
 ```bash
-python main.py
+python3 main.py
 ```
 
-The program will ask whether to calibrate.
+The program asks whether to (re)calibrate, then asks for the
+detection mode (`visible` / `ir` / `auto`) and starts the whiteboard.
+
+Other entry points:
+
+```bash
+python3 calibration.py            # calibration only (asks for mode)
+python3 calibration.py visible    # calibration in visible-light mode
+python3 light_detection.py auto   # detector test view only
+python3 run_whiteboard.py         # whiteboard only (needs calibration)
+```
 
 ## Calibration procedure
 
-The projector displays:
+Calibration has two steps and needs the projector running.
 
-1. RED
-2. GREEN
-3. BLUE
-4. WHITE
+**STEP 1 - RGBW screen detection (where is the screen?)**
 
-Press ENTER in the terminal after each color is correctly projected.
-
-The program creates four masks.
-
-The important operation is a TOLERANT intersection:
+The projector shows RED, GREEN, BLUE, WHITE. Press ENTER in the
+terminal after each color. Pixels whose Lab color changes strongly
+across those four captures belong to the projected screen:
 
 ```text
-RED confidence
-      AND
-GREEN confidence
-      AND
-BLUE confidence
-      AND
-WHITE confidence
+screen = pixels with large color change across RED/GREEN/BLUE/WHITE
 ```
 
-Each pixel gets a confidence value from 0..255. The weakest of the
-four confidence values is used. A pixel is kept when that weakest
-confidence is above `INTERSECTION_THRESHOLD`.
+This produces the search mask and four approximate corners. It is
+skipped automatically in `ir` mode (an IR camera cannot see colors).
 
-This means the camera/projector does NOT need to produce exact RGB
-values. It only needs to be sufficiently similar to the expected
-color.
+**STEP 2 - point-grid sweep (how does camera space map to desktop?)**
 
-That intersection is used to find the four screen corners.
-
-The corners are saved as:
+Press ENTER to start. The projector then shows 9 reference points,
+one at a time, at known desktop coordinates, and each is measured
+automatically (no keys needed). The 9 camera/desktop pairs are
+fitted with `cv2.findHomography(..., RANSAC)` and the program prints
+a real accuracy report:
 
 ```text
-screen_corners.npy
+Calibration accuracy (desktop pixels):
+  points measured : 9 / 9
+  mean error      : 1.83 px
+  max  error      : 3.41 px
+  mean / diagonal : 0.098 %
 ```
+
+This is the same idea as Johnny Chung Lee's calibration: real point
+correspondences instead of guessing a rectangle from a blob. If fewer
+than 4 points can be measured, the program falls back to the 4-corner
+RGBW estimate and says so.
+
+Saved files:
+
+```text
+screen_corners.npy   screen polygon in camera space (detection mask)
+calibration.npz       homography + points + capture size + desktop size
+```
+
+Do not move the camera, projector, or screen between step 1 and the
+end of step 2.
 
 ## Detection
 
-After calibration, the camera continuously searches for a bright point.
-
-The search is restricted to the calibrated screen polygon.
-
-For example:
+The detector searches for a bright blob **only inside the calibrated
+screen polygon**:
 
 ```text
 +--------------------------------------+
 |                                      |
 |        +--------------------+        |
 |        |                    |        |
-|        |        IR ●        |        |
+|        |        IR pen ●    |        |
 |        |                    |        |
 |        +--------------------+        |
 |                                      |
 +--------------------------------------+
 ```
 
-Light outside the calibrated screen is ignored.
+Modes:
 
-With a normal laptop webcam, the detector behaves as a bright-light detector.
-It cannot guarantee that a bright pixel is infrared.
+| Mode | Exposure | Threshold | Use |
+|------|----------|-----------|-----|
+| `visible` | auto | 200 | webcam + flashlight testing |
+| `ir` | locked short exposure | 240 | IR pen tracking |
+| `auto` | resolved by platform | - | `ir` on Raspberry Pi / ARM, `visible` elsewhere |
 
-With an IR-sensitive camera, the same pipeline can be used for the real IR pen.
+`auto` mode is resolved **once**, when the camera opens.
+
+With a normal laptop/Pi webcam (IR-cut filter still fitted) this is a
+bright-light detector: it cannot guarantee the light is infrared.
+For a real IR pen the camera must be IR sensitive:
+
+- Raspberry Pi **NoIR** camera, or
+- a webcam with its IR-cut filter removed, plus an
+  **IR-pass / visible-block filter** (720 / 850 / 950 nm)
 
 ## Coordinate conversion
 
-Suppose the camera sees:
+```text
+camera pixel (x, y)
+    --3x3 homography-->  desktop pixel (X, Y)
+```
+
+The homography is fitted from the measured reference points. It is
+valid at the capture size it was made at; `coordinate_mapper.py`
+rescales it automatically if the camera later delivers another frame
+size (same aspect ratio). If the desktop resolution changes, run the
+calibration again.
+
+## Raspberry Pi 3B notes
+
+- Default capture size on ARM is **640x480** (both for calibration
+  and detection - they must match). Override with `SMARTIR_RES`.
+- The detection loop is grayscale + threshold + morphology only, with
+  the morphology kernel built once and per-contour statistics
+  computed inside the contour bounding box.
+- `python3-picamera2` is strongly recommended: it is the only path
+  that can lock exposure and gain for IR tracking.
+- If only the projector is connected as a display, calibration still
+  works: the point sweep prints its progress in the terminal and
+  draws nothing but the reference point on the projector.
+
+## Environment variables
+
+```bash
+SMARTIR_CAM=0               # camera index or stream URL
+SMARTIR_RES=640x480         # capture size (calibration AND detection)
+SMARTIR_FPS=30              # capture framerate
+SMARTIR_EXPOSURE_US=8000    # IR exposure in microseconds (picamera2)
+SMARTIR_GAIN=2.0            # IR analogue gain (picamera2)
+SMARTIR_V4L2_EXPOSURE=10    # IR exposure value for V4L2 drivers
+```
+
+Example (IR pen on a Pi with the camera on the ribbon port):
+
+```bash
+SMARTIR_RES=640x480 python3 main.py
+```
+
+## Whiteboard controls
 
 ```text
-camera = (734, 421)
+C       clear canvas
+E       toggle pen / eraser
+S       save whiteboard.png
+D       toggle camera debug view
+Q / ESC quit
 ```
 
-The homography transforms it into:
+No detected light = pen lifted (a new stroke starts on the next
+detection).
 
-```text
-screen = (x, y)
-```
+## Troubleshooting calibration
 
-The transformation is calculated from the four detected screen corners.
-
-## Current hardware-testing mode
-
-You can test the complete software using:
-
-- laptop webcam
-- projected/displayed RGB colors
-- phone flashlight or other bright light
-- IR LED later, when the real hardware is available
-
-The light detector is deliberately not tied to an IR-only camera yet.
-
-
-## Calibration tolerance
-
-The main tuning values are in `calibration.py`:
-
-```python
-COLOR_DIFFERENCE_THRESHOLD = 12
-COLOR_DOMINANCE_THRESHOLD = 8
-INTERSECTION_THRESHOLD = 100
-```
-
-If calibration is still too strict, try:
-
-```python
-INTERSECTION_THRESHOLD = 70
-```
-
-or:
-
-```python
-INTERSECTION_THRESHOLD = 50
-```
-
-If the screen mask starts detecting too much background, increase the
-threshold again.
-
-The system still requires the RGBW intersection; it is simply using
-thresholded confidence values instead of exact pixel matches.
-
-
-## Important: spatial tolerance
-
-The RGBW calibration does NOT require the four masks to line up
-pixel-for-pixel.
-
-Real cameras can change exposure/white balance between captures, and
-the projected screen boundary can move by a few pixels. Each mask is
-therefore expanded before the intersection.
-
-Main setting:
-
-```python
-INTERSECTION_TOLERANCE_PIXELS = 25
-```
-
-For a difficult webcam/projector setup, try:
-
-```python
-INTERSECTION_TOLERANCE_PIXELS = 40
-```
-
-If the intersection becomes too large/noisy, reduce it to 15 or 10.
-
-The program also prints the percentage of the frame detected by each
-individual RED/GREEN/BLUE/WHITE mask. This makes it possible to tell
-which stage is failing.
-
-
-## Latest calibration method
-
-The calibration now uses a more robust approach for laptop webcams:
-
-1. Detect the dominant RGB channel instead of matching exact RGB values.
-2. Use adaptive thresholds based on the captured frame.
-3. Keep the largest coherent candidate region for each color.
-4. Expand each candidate region by the spatial tolerance.
-5. Intersect RED, GREEN, BLUE and WHITE.
-
-For the current webcam-testing setup the default spatial tolerance is
-100 pixels. Once the actual hardware/camera position is fixed, this can
-be reduced.
+- `Detected screen area: x % of the frame` (step 1) should be a few
+  percent to ~50 %. Near 0 % or ~100 % means the color phase failed -
+  check that the projector is actually visible to the camera.
+- Low point-sweep hit rate: darken the room, check that the camera
+  really sees the projector, and verify you are not in `ir` mode with
+  an IR-filtered camera.
+- High reprojection error: something moved between captures, or the
+  projector and desktop resolutions do not match.
+- Detection too noisy: raise the threshold in
+  `light_detection.py` (`IR_THRESHOLD` / `VISIBLE_THRESHOLD`).
