@@ -6,6 +6,7 @@ import numpy as np
 
 from camera import (
     open_camera,
+    require_display,
     resolve_mode,
     CAMERA_WIDTH,
     CAMERA_HEIGHT,
@@ -1093,6 +1094,10 @@ def main():
     cap = None
 
     try:
+        # Bail out with instructions (instead of letting the Qt
+        # backend abort the process) when there is no display.
+        require_display()
+
         print("\n" + "=" * 70)
         print("SMARTIR SCREEN CALIBRATION")
         print("STEP 1: RGBW screen detection")

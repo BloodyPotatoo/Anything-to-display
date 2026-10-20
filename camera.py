@@ -1,6 +1,7 @@
 import glob
 import os
 import platform
+import sys
 import threading
 import time
 
@@ -101,6 +102,96 @@ def attempt_with_timeout(description, factory, timeout_seconds):
         return None
 
     return result.get("value")
+
+
+def display_available():
+    """
+    Best-effort check that a graphical session exists.
+
+    OpenCV's Qt backend calls abort() when it cannot connect to
+    the display, which kills the process with no Python
+    traceback - so we detect the situation first and print real
+    instructions instead.
+    """
+    # A headless Qt platform (offscreen/minimal) needs no session
+    # at all - only those are trusted blindly. A fallback list
+    # like "wayland;xcb" still needs a real session, so it falls
+    # through to the checks below.
+    qt_platform = os.environ.get("QT_QPA_PLATFORM", "")
+
+    headless_platforms = {"offscreen", "minimal", "minimalegl"}
+
+    if any(
+        part.strip() in headless_platforms
+        for part in qt_platform.split(";")
+        if part.strip()
+    ):
+        return True
+
+    if platform.system() != "Linux":
+        return True
+
+    # Wayland (Raspberry Pi OS Bookworm and most modern desktops).
+    wayland = os.environ.get("WAYLAND_DISPLAY")
+
+    if wayland:
+        runtime = os.environ.get(
+            "XDG_RUNTIME_DIR",
+            f"/run/user/{os.getuid()}",
+        )
+
+        if os.path.exists(os.path.join(runtime, wayland)):
+            return True
+
+    # X11.
+    display = os.environ.get("DISPLAY")
+
+    if display:
+        if display.startswith(":"):
+            # Local display such as ":0" / ":0.0" needs its socket.
+            # A stale DISPLAY with no X server = Qt abort.
+            number = display[1:].split(".")[0]
+
+            if os.path.exists(f"/tmp/.X11-unix/X{number}"):
+                return True
+        else:
+            # Remote/forwarded display (ssh -X): trust it.
+            return True
+
+    return False
+
+
+def require_display():
+    """
+    Exit cleanly with setup instructions when no graphical
+    session is available. Called before any window is created.
+    """
+    if display_available():
+        return
+
+    print("\n" + "=" * 66)
+    print("NO GRAPHICAL DISPLAY - CANNOT OPEN THE PROJECTOR WINDOW")
+    print("=" * 66)
+    print(
+        "DISPLAY / WAYLAND_DISPLAY is not set or does not point to\n"
+        "a running session. SMARTIR needs a graphical session for:\n"
+        "  - projecting the calibration colors and points\n"
+        "  - the whiteboard / detector windows\n"
+        "\n"
+        "Fix (pick one):\n"
+        "  1. Run from a terminal ON the Pi's desktop (simplest).\n"
+        "  2. X session, running over SSH:\n"
+        "         export DISPLAY=:0\n"
+        "  3. Wayland session (Raspberry Pi OS Bookworm), over SSH:\n"
+        "         export XDG_RUNTIME_DIR=/run/user/$(id -u)\n"
+        "         export WAYLAND_DISPLAY=wayland-0\n"
+        "  4. SSH with X forwarding:  ssh -X pi@<pi-address>\n"
+        "\n"
+        "Tip: add the export lines to ~/.bashrc so SSH sessions get\n"
+        "them automatically."
+    )
+    print("=" * 66)
+    sys.exit(1)
 
 
 def is_raspberry_pi():

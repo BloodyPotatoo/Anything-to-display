@@ -3,7 +3,7 @@ import sys
 import cv2
 import numpy as np
 
-from camera import open_camera, resolve_mode
+from camera import open_camera, require_display, resolve_mode
 from coordinate_mapper import CoordinateMapper
 
 # ============================================================
@@ -184,6 +184,10 @@ def find_light(mask, frame, mode="visible"):
 
 
 def run_light_detection(mapper, mode="visible"):
+    # Needs windows for the live view; fail with instructions
+    # instead of letting Qt abort the process.
+    require_display()
+
     camera = None
 
     try:

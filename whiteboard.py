@@ -2,7 +2,7 @@ import os
 import cv2
 import numpy as np
 
-from camera import open_camera
+from camera import open_camera, require_display
 from coordinate_mapper import CoordinateMapper
 from light_detection import make_screen_mask, find_light
 
@@ -298,6 +298,10 @@ def make_debug_frame(
 
 
 def main():
+    # Clean early exit when no graphical session exists (the Qt
+    # GUI backend would otherwise abort() the whole process).
+    require_display()
+
     print("\n" + "=" * 70)
     print("SMARTIR - REAL-TIME DIGITAL WHITEBOARD")
     print("=" * 70)
