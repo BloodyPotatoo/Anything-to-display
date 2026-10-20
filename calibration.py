@@ -1,3 +1,4 @@
+import glob
 import os
 import platform
 import sys
@@ -90,13 +91,13 @@ def get_camera_backends():
     system = platform.system()
 
     if system == "Windows":
-        return [cv2.CAP_MSMF, cv2.CAP_DSHOW, cv2.CAP_ANY]
+        return [cv2.CAP_DSHOW, cv2.CAP_MSMF]
 
     if system == "Darwin":
-        return [cv2.CAP_AVFOUNDATION, cv2.CAP_ANY]
+        return [cv2.CAP_AVFOUNDATION]
 
     if system == "Linux":
-        return [cv2.CAP_V4L2, cv2.CAP_ANY]
+        return [cv2.CAP_V4L2]
 
     return [cv2.CAP_ANY]
 
@@ -108,15 +109,32 @@ def backend_name(backend):
         cv2.CAP_MSMF: "MSMF",
         cv2.CAP_DSHOW: "DirectShow",
         cv2.CAP_AVFOUNDATION: "AVFoundation",
+        cv2.CAP_GSTREAMER: "GStreamer",
     }
     return names.get(backend, str(backend))
 
 
-def try_camera(index, backend):
-    print(f"Trying camera index {index} using {backend_name(backend)}...")
+def get_available_indices():
+    """Find valid camera indices based on OS devices."""
+    if platform.system() == "Linux":
+        devices = sorted(glob.glob("/dev/video*"))
+        indices = []
+        for dev in devices:
+            try:
+                num = int(dev.replace("/dev/video", ""))
+                indices.append(num)
+            except ValueError:
+                pass
+        return indices if indices else [0]
+    return list(range(MAX_CAMERA_INDEX))
+
+
+def try_camera(index_or_source, backend):
+    backend_lbl = backend_name(backend)
+    print(f"Trying camera {index_or_source} using {backend_lbl}...")
 
     try:
-        cap = cv2.VideoCapture(index, backend)
+        cap = cv2.VideoCapture(index_or_source, backend)
     except Exception:
         return None
 
@@ -124,28 +142,63 @@ def try_camera(index, backend):
         cap.release()
         return None
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-    cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
-
+    # Try standard resolution first
     try:
-        cap.set(
-            cv2.CAP_PROP_FOURCC,
-            cv2.VideoWriter_fourcc(*"MJPG")
-        )
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+        cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
     except Exception:
         pass
 
-    time.sleep(0.2)
+    time.sleep(0.15)
 
-    for _ in range(10):
+    # Validate reading frames
+    for _ in range(5):
         ret, frame = cap.read()
         if ret and frame is not None and frame.size:
             if len(frame.shape) == 3 and frame.shape[2] == 3:
                 return cap
         time.sleep(0.05)
 
+    # If 1280x720 failed, retry with lower/default resolution (common on Pi cameras)
+    try:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        time.sleep(0.1)
+        ret, frame = cap.read()
+        if ret and frame is not None and frame.size:
+            return cap
+    except Exception:
+        pass
+
     cap.release()
+    return None
+
+
+def try_rpi_libcamera():
+    """Attempt opening Raspberry Pi camera via libcamerasrc GStreamer pipeline."""
+    if platform.system() != "Linux":
+        return None
+
+    gst_pipelines = [
+        f"libcamerasrc ! video/x-raw, width={CAMERA_WIDTH}, height={CAMERA_HEIGHT}, framerate={CAMERA_FPS}/1 ! videoconvert ! appsink drop=true",
+        "libcamerasrc ! video/x-raw, width=640, height=480 ! videoconvert ! appsink drop=true",
+    ]
+
+    for pipeline in gst_pipelines:
+        try:
+            print("Trying Raspberry Pi libcamera pipeline...")
+            cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+            if cap.isOpened():
+                time.sleep(0.2)
+                ret, frame = cap.read()
+                if ret and frame is not None and frame.size:
+                    print("Connected successfully via libcamerasrc pipeline!")
+                    return cap
+                cap.release()
+        except Exception:
+            pass
+
     return None
 
 
@@ -159,16 +212,28 @@ def open_camera():
     if custom_cam:
         print(f"Using custom camera source from SMARTIR_CAM: {custom_cam}")
         source = int(custom_cam) if custom_cam.isdigit() else custom_cam
-        cap = cv2.VideoCapture(source, cv2.CAP_V4L2 if platform.system() == "Linux" else cv2.CAP_ANY)
-        if cap.isOpened():
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+        cap = try_camera(source, cv2.CAP_V4L2 if platform.system() == "Linux" else cv2.CAP_ANY)
+        if cap is not None:
             return cap
         else:
             print("Warning: Could not open custom camera source. Falling back to auto-scan.")
 
-    # On Linux / Raspberry Pi, default CSI ribbon camera shows up under V4L2 at /dev/video0 or video1
-    for index in range(MAX_CAMERA_INDEX):
+    # Try Raspberry Pi libcamera pipeline first if on Linux
+    if platform.system() == "Linux":
+        cap = try_rpi_libcamera()
+        if cap is not None:
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            print("\nCamera found via libcamera pipeline!")
+            print(f"Resolution: {width} x {height}")
+            print(f"FPS: {fps:.1f}")
+            print("=" * 60)
+            return cap
+
+    # Scan available video devices
+    available_indices = get_available_indices()
+    for index in available_indices:
         for backend in get_camera_backends():
             cap = try_camera(index, backend)
             if cap is not None:
@@ -184,7 +249,7 @@ def open_camera():
                 print("=" * 60)
                 return cap
 
-    raise RuntimeError("No usable camera was found. Ensure ribbon cable camera is connected and enabled via raspi-config / v4l2.")
+    raise RuntimeError("No usable camera was found. Ensure camera is connected and enabled via raspi-config / v4l2.")
 
 
 def create_projector_window():

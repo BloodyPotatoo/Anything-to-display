@@ -1,3 +1,4 @@
+import glob
 import os
 import platform
 import sys
@@ -40,15 +41,30 @@ def get_backends():
     system = platform.system()
 
     if system == "Windows":
-        return [cv2.CAP_MSMF, cv2.CAP_DSHOW, cv2.CAP_ANY]
+        return [cv2.CAP_DSHOW, cv2.CAP_MSMF]
 
     if system == "Darwin":
-        return [cv2.CAP_AVFOUNDATION, cv2.CAP_ANY]
+        return [cv2.CAP_AVFOUNDATION]
 
     if system == "Linux":
-        return [cv2.CAP_V4L2, cv2.CAP_ANY]
+        return [cv2.CAP_V4L2]
 
     return [cv2.CAP_ANY]
+
+
+def get_available_indices():
+    """Find valid camera indices based on OS devices."""
+    if platform.system() == "Linux":
+        devices = sorted(glob.glob("/dev/video*"))
+        indices = []
+        for dev in devices:
+            try:
+                num = int(dev.replace("/dev/video", ""))
+                indices.append(num)
+            except ValueError:
+                pass
+        return indices if indices else [0]
+    return list(range(MAX_CAMERA_INDEX))
 
 
 def resolve_mode(mode):
@@ -62,6 +78,33 @@ def resolve_mode(mode):
             print(f"Auto-detected {system} PC: Selecting 'visible' mode.")
             return "visible"
     return mode
+
+
+def try_rpi_libcamera(resolved_mode):
+    """Attempt opening Raspberry Pi camera via libcamerasrc GStreamer pipeline."""
+    if platform.system() != "Linux":
+        return None
+
+    gst_pipelines = [
+        f"libcamerasrc ! video/x-raw, width={CAMERA_WIDTH}, height={CAMERA_HEIGHT}, framerate={CAMERA_FPS}/1 ! videoconvert ! appsink drop=true",
+        "libcamerasrc ! video/x-raw, width=640, height=480 ! videoconvert ! appsink drop=true",
+    ]
+
+    for pipeline in gst_pipelines:
+        try:
+            print("Trying Raspberry Pi libcamera pipeline...")
+            cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+            if cap.isOpened():
+                time.sleep(0.2)
+                ret, frame = cap.read()
+                if ret and frame is not None and frame.size:
+                    print("Connected successfully via libcamerasrc pipeline!")
+                    return cap
+                cap.release()
+        except Exception:
+            pass
+
+    return None
 
 
 def open_camera(mode="visible"):
@@ -81,7 +124,14 @@ def open_camera(mode="visible"):
         else:
             print("Warning: Could not open custom camera source. Falling back to auto-scan.")
 
-    for index in range(MAX_CAMERA_INDEX):
+    # Try libcamera GStreamer pipeline first if on Linux
+    if platform.system() == "Linux":
+        cap = try_rpi_libcamera(resolved_mode)
+        if cap is not None:
+            return cap
+
+    available_indices = get_available_indices()
+    for index in available_indices:
         for backend in get_backends():
 
             try:
@@ -96,33 +146,15 @@ def open_camera(mode="visible"):
                 camera.release()
                 continue
 
-            camera.set(
-                cv2.CAP_PROP_FRAME_WIDTH,
-                CAMERA_WIDTH
-            )
-
-            camera.set(
-                cv2.CAP_PROP_FRAME_HEIGHT,
-                CAMERA_HEIGHT
-            )
-
-            camera.set(
-                cv2.CAP_PROP_FPS,
-                CAMERA_FPS
-            )
-
             try:
-                camera.set(
-                    cv2.CAP_PROP_FOURCC,
-                    cv2.VideoWriter_fourcc(*"MJPG")
-                )
+                camera.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+                camera.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+                camera.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
             except Exception:
                 pass
 
             # Apply exposure settings based on the resolved mode
             if resolved_mode == "ir":
-                # Optimize exposure for IR tracking:
-                # Lower exposure darkens the background, leaving only the bright IR LED.
                 try:
                     camera.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)  # 1 = Manual Mode
                     camera.set(cv2.CAP_PROP_EXPOSURE, 10)      # Very low exposure value
@@ -130,7 +162,6 @@ def open_camera(mode="visible"):
                 except Exception:
                     pass
             else:
-                # For visible mode, ensure auto-exposure is enabled for standard webcams
                 try:
                     camera.set(cv2.CAP_PROP_AUTO_EXPOSURE, 3)  # 3 = Auto Mode
                     print("Applied auto-exposure settings for visible light tracking.")
@@ -141,11 +172,20 @@ def open_camera(mode="visible"):
 
             ret, frame = camera.read()
 
+            # Retry with fallback resolution if 1280x720 allocation failed
+            if not ret or frame is None or not frame.size:
+                try:
+                    camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                    time.sleep(0.1)
+                    ret, frame = camera.read()
+                except Exception:
+                    pass
+
             if ret and frame is not None and frame.size:
                 print(
                     f"Camera selected: index {index}"
                 )
-
                 return camera
 
             camera.release()
