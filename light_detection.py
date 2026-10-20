@@ -66,14 +66,14 @@ def resolve_mode(mode):
 
 def open_camera(mode="visible"):
     resolved_mode = resolve_mode(mode)
-    print(f"\nSearching for detection camera (Mode: {resolved_mode})...")
+    print(f"\nSearching for detection camera on Raspberry Pi / PC (Mode: {resolved_mode})...")
 
     # Check if a custom IP camera URL or specific index is provided via environment variable
     custom_cam = os.environ.get("SMARTIR_CAM")
     if custom_cam:
         print(f"Using custom camera source from SMARTIR_CAM: {custom_cam}")
         source = int(custom_cam) if custom_cam.isdigit() else custom_cam
-        camera = cv2.VideoCapture(source)
+        camera = cv2.VideoCapture(source, cv2.CAP_V4L2 if platform.system() == "Linux" else cv2.CAP_ANY)
         if camera.isOpened():
             camera.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
             camera.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
@@ -151,7 +151,7 @@ def open_camera(mode="visible"):
             camera.release()
 
     raise RuntimeError(
-        "Could not open a usable camera."
+        "Could not open a usable camera on the CSI ribbon port or USB."
     )
 
 

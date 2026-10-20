@@ -151,16 +151,15 @@ def try_camera(index, backend):
 
 def open_camera():
     print("\n" + "=" * 60)
-    print("AUTOMATIC CAMERA DETECTION")
+    print("AUTOMATIC CAMERA DETECTION (Raspberry Pi & OS Compatible)")
     print("=" * 60)
 
     # Check if a custom IP camera URL or specific index is provided via environment variable
     custom_cam = os.environ.get("SMARTIR_CAM")
     if custom_cam:
         print(f"Using custom camera source from SMARTIR_CAM: {custom_cam}")
-        # If it's a digit, convert to int index, otherwise treat as network stream URL
         source = int(custom_cam) if custom_cam.isdigit() else custom_cam
-        cap = cv2.VideoCapture(source)
+        cap = cv2.VideoCapture(source, cv2.CAP_V4L2 if platform.system() == "Linux" else cv2.CAP_ANY)
         if cap.isOpened():
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
@@ -168,6 +167,7 @@ def open_camera():
         else:
             print("Warning: Could not open custom camera source. Falling back to auto-scan.")
 
+    # On Linux / Raspberry Pi, default CSI ribbon camera shows up under V4L2 at /dev/video0 or video1
     for index in range(MAX_CAMERA_INDEX):
         for backend in get_camera_backends():
             cap = try_camera(index, backend)
@@ -184,7 +184,7 @@ def open_camera():
                 print("=" * 60)
                 return cap
 
-    raise RuntimeError("No usable camera was found.")
+    raise RuntimeError("No usable camera was found. Ensure ribbon cable camera is connected and enabled via raspi-config / v4l2.")
 
 
 def create_projector_window():
@@ -682,8 +682,6 @@ def draw_result(frame, corners):
         )
 
     return output
-
-
 
 
 def save_calibration(corners):
