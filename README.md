@@ -254,3 +254,16 @@ detection).
   projector and desktop resolutions do not match.
 - Detection too noisy: raise the threshold in
   `light_detection.py` (`IR_THRESHOLD` / `VISIBLE_THRESHOLD`).
+
+### PiCameraStream (`_camera.close()` in `read()`)
+
+The `PiCameraStream` class in `camera.py` calls `self._camera.close()`
+inside `read()` instead of `capture_array()`. This prevents the
+picamera2 CSI camera from opening at all: the error is
+`'PiCameraStream' object has no attribute '_opened'` (or a
+segmentation fault), and SMARTIR falls back through libcamera
+GStreamer and V4L2, eventually settling on a broken V4L2 source.
+
+**Fix:** call `self._camera.capture_array("main")` in `read()`,
+not `self._camera.close()`. `release()` is correct and stops the
+camera properly.

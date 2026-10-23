@@ -458,13 +458,17 @@ class PiCameraStream:
         self._width = int(width)
         self._height = int(height)
         self._fps = float(fps)
+
+        # The preview window only downscales what the camera sees;
+        # the detection loop works on the full-resolution frame.
         self._opened = True
+        self._preview_window = None
 
     def isOpened(self):
         return self._opened
 
     def read(self):
-        if not self._opened:
+        if not self.isOpened():
             return False, None
 
         try:
@@ -484,6 +488,22 @@ class PiCameraStream:
 
         # Requested format is RGB888, OpenCV wants BGR.
         return True, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+    def release(self):
+        if not self._opened:
+            return
+
+        self._opened = False
+
+        try:
+            self._camera.stop()
+        except Exception:
+            pass
+
+        try:
+            self._camera.close()
+        except Exception:
+            pass
 
     def set(self, prop, value):
         # The pipeline is fixed at configure time (size/fps/exposure
@@ -544,24 +564,6 @@ def draw_preview(window_name, frame, width, height):
         cv2.imshow(window_name, preview)
     except Exception:
         pass
-
-
-class PiCameraStream:
-    def __init__(self, width, height, fps, mode):
-        if not self._opened:
-            return
-
-        self._opened = False
-
-        try:
-            self._camera.stop()
-        except Exception:
-            pass
-
-        try:
-            self._camera.close()
-        except Exception:
-            pass
 
 
 def _try_open_picamera2(resolved_mode):
