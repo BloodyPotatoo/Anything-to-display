@@ -19,7 +19,8 @@ from coordinate_mapper import CoordinateMapper
 CALIBRATION_FILE = "screen_corners.npy"
 HOMOGRAPHY_FILE = "calibration.npz"
 
-# --- Grid configuration ---GRID_COLS = 3
+# --- Grid configuration ---
+GRID_COLS = 3
 GRID_ROWS = 3
 NUM_POINTS = GRID_COLS * GRID_ROWS  # 9 points
 
