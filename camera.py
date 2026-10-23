@@ -309,7 +309,12 @@ def _resolution_from_env(name, default):
         return default
 
 
-_PREVIEW_ENABLED = os.environ.get("SMARTIR_PREVIEW", "1").strip().lower() in ("1", "true", "yes", "on")
+_PREVIEW_ENABLED = os.environ.get("SMARTIR_PREVIEW", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 if _PREVIEW_ENABLED:
     _PREVIEW_RES = _resolution_from_env("SMARTIR_PREVIEW_RES", (480, 360))
@@ -533,12 +538,7 @@ def create_preview_window(window_name, width, height):
     if width <= 0 or height <= 0:
         return None
 
-    cv2.namedWindow(
-        window_name,
-        cv2.WINDOW_NORMAL,
-        cv2.WINDOW_KEEPRATIO,
-    )
-
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, width, height)
     cv2.setWindowProperty(
         window_name,
@@ -803,8 +803,6 @@ def open_camera(mode="visible"):
         if stream is not None:
             # Start a small live preview of what the camera sees.
             if _PREVIEW_ENABLED:
-                if "_PREVIEW_WINDOW" in globals():
-                    del _PREVIEW_WINDOW
                 _PREVIEW_WINDOW = create_preview_window(
                     "SMARTIR Camera Preview",
                     _PREVIEW_WIDTH,
@@ -849,8 +847,6 @@ def open_camera(mode="visible"):
         if cap is not None:
             # Start a small live preview of what the camera sees.
             if _PREVIEW_ENABLED:
-                if "_PREVIEW_WINDOW" in globals():
-                    del _PREVIEW_WINDOW
                 _PREVIEW_WINDOW = create_preview_window(
                     "SMARTIR Camera Preview",
                     _PREVIEW_WIDTH,
@@ -863,7 +859,10 @@ def open_camera(mode="visible"):
     # 4. Show the preview alongside the camera
     # --------------------------------------------------------
     if _PREVIEW_ENABLED:
-        if "_PREVIEW_WINDOW" in globals():
+        # Only create the preview when the camera actually opened.
+        # The del above is a no-op when the camera failed: there was
+        # no _PREVIEW_WINDOW to delete, so skip the delete entirely.
+        if "PREVIEW_WINDOW" in globals():
             del _PREVIEW_WINDOW
         _PREVIEW_WINDOW = create_preview_window(
             "SMARTIR Camera Preview",
@@ -903,4 +902,3 @@ def cleanup_preview():
     if _PREVIEW_WINDOW is not None:
         cv2.destroyWindow(_PREVIEW_WINDOW)
         _PREVIEW_WINDOW = None
-

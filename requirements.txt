@@ -1,5 +1,6 @@
 opencv-python
 numpy
+picamera2
 
 # Raspberry Pi (CSI ribbon camera): do NOT pip install these.
 # Use the distro packages instead:

@@ -10,15 +10,14 @@ on the default ribbon (CSI) port.
 
 ```text
 CALIBRATION
-  STEP 1: RED -> GREEN -> BLUE -> WHITE color-change
-          -> screen mask + approximate corners
-  STEP 2: 9 reference points projected one at a time
-          -> measured in camera space
-          -> RANSAC homography + error report
-          -> screen_corners.npy + calibration.npz
+  STEP 1 (auto): RED / GREEN / BLUE / WHITE color phase -> screen mask
+                 + 4 calibrated screen corners
+  STEP 2 (auto): 9 reference points projected one at a time
+                 -> pen measured automatically -> RANSAC homography
+                 -> screen_corners.npy + calibration.npz
 DETECTION
   camera frame -> screen polygon mask -> bright blob -> centroid
-          -> homography -> desktop coordinate -> drawn segment
+                -> homography -> desktop coordinate -> drawn segment
 ```
 
 ## Files
@@ -27,10 +26,10 @@ DETECTION
 |------|---------|
 | `main.py` | entry point: calibrate (if needed) then start the whiteboard |
 | `camera.py` | shared camera layer: CSI/picamera2, GStreamer, V4L2, exposure modes |
-| `calibration.py` | screen detection (RGBW) + point-grid homography calibration |
+| `calibration.py` | screen detection (RGBW) + point-grid homography calibration (fully automatic) |
 | `coordinate_mapper.py` | camera -> desktop homography, screen-size detection |
 | `light_detection.py` | bright/IR light detector (standalone test view) |
-| `whiteboard.py` | the drawing application |
+| `whiteboard.py` | the drawing application (canvas content is always shown) |
 | `screen_corners.npy` | generated: screen polygon in camera space |
 | `calibration.npz` | generated: homography, points, frame size, screen size |
 
@@ -39,7 +38,7 @@ DETECTION
 PC:
 
 ```bash
-pip install opencv-python numpy
+pip install opencv-python numpy picamera2
 ```
 
 Raspberry Pi (use the distro packages - they match the camera stack):
@@ -67,7 +66,7 @@ detection mode (`visible` / `ir` / `auto`) and starts the whiteboard.
 Other entry points:
 
 ```bash
-python3 calibration.py            # calibration only (asks for mode)
+python3 calibration.py            # calibration only (fully automatic)
 python3 calibration.py visible    # calibration in visible-light mode
 python3 light_detection.py auto   # detector test view only
 python3 run_whiteboard.py         # whiteboard only (needs calibration)
@@ -75,28 +74,24 @@ python3 run_whiteboard.py         # whiteboard only (needs calibration)
 
 ## Calibration procedure
 
-Calibration has two steps and needs the projector running.
+Calibrate has two steps and runs **completely automatically** - no key
+presses, no ENTER prompts, no manual colour changes.
 
-**STEP 1 - RGBW screen detection (where is the screen?)**
+**STEP 1 - RGBW screen detection (automatic)**
 
-The projector shows RED, GREEN, BLUE, WHITE. Press ENTER in the
-terminal after each color. Pixels whose Lab color changes strongly
-across those four captures belong to the projected screen:
+The projector cycles RED → GREEN → BLUE → WHITE. The detector captures
+each phase and keeps only the pixels whose Lab colour changes strongly
+across the four captures. Those pixels are the projected screen, so
+they produce the search mask and the four calibrated screen corners.
 
-```text
-screen = pixels with large color change across RED/GREEN/BLUE/WHITE
-```
+**STEP 2 - point-grid sweep (automatic)**
 
-This produces the search mask and four approximate corners. It is
-skipped automatically in `ir` mode (an IR camera cannot see colors).
-
-**STEP 2 - point-grid sweep (how does camera space map to desktop?)**
-
-Press ENTER to start. The projector then shows 9 reference points,
-one at a time, at known desktop coordinates, and each is measured
-automatically (no keys needed). The 9 camera/desktop pairs are
-fitted with `cv2.findHomography(..., RANSAC)` and the program prints
-a real accuracy report:
+The projector shows 9 reference points, one at a time, at known
+desktop coordinates. On each point the pen is auto-detected (the
+system waits for the light to be present for `IR_CAPTURE_DURATION`
+seconds). The 9 camera/desktop pairs are fitted with
+`cv2.findHomography(..., RANSAC)` and the program prints a real
+accuracy report:
 
 ```text
 Calibration accuracy (desktop pixels):
@@ -106,10 +101,9 @@ Calibration accuracy (desktop pixels):
   mean / diagonal : 0.098 %
 ```
 
-This is the same idea as Johnny Chung Lee's calibration: real point
-correspondences instead of guessing a rectangle from a blob. If fewer
-than 4 points can be measured, the program falls back to the 4-corner
-RGBW estimate and says so.
+A point that the pen never reaches is simply skipped - it is never
+written into the homography, so a missed point cannot corrupt the
+calibration.
 
 Saved files:
 
@@ -142,7 +136,7 @@ Modes:
 
 | Mode | Exposure | Threshold | Use |
 |------|----------|-----------|-----|
-| `visible` | auto exposure | 200 | webcam + flashlight testing |
+| `visible` | auto exposure | adaptive | webcam + flashlight testing |
 | `ir` | locked exposure (shutter) | adaptive | IR pen tracking |
 | `auto` | resolved by platform | - | `ir` on Raspberry Pi / ARM, `visible` elsewhere |
 
@@ -168,8 +162,7 @@ SMARTIR_GAIN                     -> default 2.0  (analogue gain)
 You can override them: `SMARTIR_EXPOSURE_US=80000 python main.py` for a
 very long shutter. The detection threshold in `calibration.py` is also
 **adaptive**: it is a fraction of the frame's own brightness, so a
-dim pen at a high exposure is matched by `max(percentile * 0.5,
-mean * 0.7, 25)` instead of a hard 95/240 floor.
+dim pen at a high exposure is matched instead of a hard 95/240 floor.
 
 `auto` mode is resolved **once**, when the camera opens.
 
@@ -198,9 +191,6 @@ calibration again.
 
 - Default capture size on ARM is **640x480** (both for calibration
   and detection - they must match). Override with `SMARTIR_RES`.
-- The detection loop is grayscale + threshold + morphology only, with
-  the morphology kernel built once and per-contour statistics
-  computed inside the contour bounding box.
 - `python3-picamera2` is strongly recommended: it is the only path
   that can lock exposure and gain for IR tracking.
 - If only the projector is connected as a display, calibration still
@@ -239,14 +229,15 @@ D       toggle camera debug view
 Q / ESC quit
 ```
 
-No detected light = pen lifted (a new stroke starts on the next
-detection).
+The canvas content is always drawn to the main window - strokes are
+never lost in the status bar. No detected light = pen lifted (a new
+stroke starts on the next detection).
 
 ## Troubleshooting calibration
 
-- `Detected screen area: x % of the frame` (step 1) should be a few
-  percent to ~50 %. Near 0 % or ~100 % means the color phase failed -
-  check that the projector is actually visible to the camera.
+- STEP 1 (RGBW) should report a screen area of a few percent to ~50 %.
+  Near 0 % or ~100 % means the colour phase failed - check that the
+  projector is actually visible to the camera.
 - Low point-sweep hit rate: darken the room, check that the camera
   really sees the projector, and verify you are not in `ir` mode with
   an IR-filtered camera.
@@ -255,15 +246,6 @@ detection).
 - Detection too noisy: raise the threshold in
   `light_detection.py` (`IR_THRESHOLD` / `VISIBLE_THRESHOLD`).
 
-### PiCameraStream (`_camera.close()` in `read()`)
-
-The `PiCameraStream` class in `camera.py` calls `self._camera.close()`
-inside `read()` instead of `capture_array()`. This prevents the
-picamera2 CSI camera from opening at all: the error is
-`'PiCameraStream' object has no attribute '_opened'` (or a
-segmentation fault), and SMARTIR falls back through libcamera
-GStreamer and V4L2, eventually settling on a broken V4L2 source.
-
-**Fix:** call `self._camera.capture_array("main")` in `read()`,
-not `self._camera.close()`. `release()` is correct and stops the
-camera properly.
+The PiCameraStream class in `camera.py` calls `self._camera.capture_array("main")`
+inside `read()` (not `self._camera.close()`, which would stop the
+camera). `release()` is correct and stops the camera properly.

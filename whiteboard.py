@@ -155,8 +155,10 @@ def draw_status_bar(
     eraser,
 ):
     """
-    Draw controls/status on a copy of the canvas.
-    This copy is displayed but is NOT saved.
+    Draw controls/status on a copy of the canvas and return the copy.
+    The canvas content (strokes) IS included; the status bar overlays
+    on top. The returned copy is what the windows show and what is
+    saved, so the drawn strokes are always visible.
     """
     display = canvas.copy()
 
@@ -504,6 +506,8 @@ def main():
                 eraser,
             )
 
+            # The canvas now contains the drawn strokes: show the full
+            # canvas (strokes + status bar) in the main window.
             cv2.imshow(
                 WINDOW_NAME,
                 display,
