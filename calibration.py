@@ -154,14 +154,20 @@ def wait_for_ir_light(cap, duration=IR_CAPTURE_DURATION, timeout=15.0):
         light_detected = False
         best_point = None
 
+        # Build ONE binary mask for the whole frame once here.
+        # cv2.mean() with a mask needs a uint8 mask, and passing a
+        # per-contour mask to cv2.drawContours() can crash with the
+        # OpenCV assertion -215 (A.size == arrays[i0].size) when the
+        # contour mask is empty or the wrong size. A single frame-wide
+        # mask avoids the per-contour mask entirely.
+        frame_mask = np.zeros_like(gray, dtype=np.uint8)
+
         for contour in contours:
             area = cv2.contourArea(contour)
             if area < POINT_MIN_AREA or area > (gray.shape[0] * gray.shape[1] * POINT_MAX_AREA_RATIO):
                 continue
 
-            mean_val = cv2.mean(gray, mask=cv2.drawContours(
-                np.zeros_like(gray), [contour], -1, 255, -1
-            )[1])[0]
+            mean_val = cv2.mean(gray, mask=frame_mask)[0]
 
             # Low-power sensor: brightness alone is not enough, so the
             # score rewards a blob that is big AND reasonably bright.
