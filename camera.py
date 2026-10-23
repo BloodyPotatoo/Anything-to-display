@@ -47,12 +47,29 @@ DEFAULT_FPS = 30
 
 # ------------------------------------------------------------
 # IR-mode settings (Raspberry Pi NoIR / IR-sensitive cameras).
-# Short exposure + locked gain makes the IR pen blob stable and
-# rejects most ambient light.
+#
+# EXPOSURE (shutter speed):
+#   The camera's shutter (exposure) is what CATCHES IR light.
+#   - A short exposure only works when the sensor is a real NoIR /
+#     IR-sensitive one. With a normal webcam (IR-cut filter still
+#     fitted) a short exposure makes the frame black and the pen
+#     disappears, so on a normal camera we rely on auto exposure.
+#   - SMARTIR_EXPOSURE_US: IR exposure in microseconds (picamera2).
+#     HIGH = longer shutter = more light gathered = the pen shows
+#     up on a weak / low-power sensor or a far-away pen.
+#   - SMARTIR_V4L2_EXPOSURE: IR exposure value (V4L2 drivers)
+#     HIGH = longer shutter for the same reason.
+#
+#   Defaults are HIGH now so the pen is always visible:
+#     picamera2  -> 40000 us  (40 ms)
+#     V4L2       -> 16         (manual exposure value)
+#
+#   For a real NoIR camera this is stable and catches the IR pen
+#   even in a normal room, without any IR-pass filter.
 # ------------------------------------------------------------
-IR_EXPOSURE_US = int(os.environ.get("SMARTIR_EXPOSURE_US", "8000"))
+IR_EXPOSURE_US = int(os.environ.get("SMARTIR_EXPOSURE_US", "40000"))
 IR_ANALOGUE_GAIN = float(os.environ.get("SMARTIR_GAIN", "2.0"))
-IR_V4L2_EXPOSURE = int(os.environ.get("SMARTIR_V4L2_EXPOSURE", "10"))
+IR_V4L2_EXPOSURE = int(os.environ.get("SMARTIR_V4L2_EXPOSURE", "16"))
 
 # ------------------------------------------------------------
 # Startup attempt timeouts (seconds).

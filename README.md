@@ -142,9 +142,34 @@ Modes:
 
 | Mode | Exposure | Threshold | Use |
 |------|----------|-----------|-----|
-| `visible` | auto | 200 | webcam + flashlight testing |
-| `ir` | locked short exposure | 240 | IR pen tracking |
+| `visible` | auto exposure | 200 | webcam + flashlight testing |
+| `ir` | locked exposure (shutter) | adaptive | IR pen tracking |
 | `auto` | resolved by platform | - | `ir` on Raspberry Pi / ARM, `visible` elsewhere |
+
+### Why IR light is not detected on a low-power sensor
+
+IR light is invisible to the human eye, so the camera can only see it
+because the sensor is fed *light* to collect. The exposure (shutter
+speed) is what catches IR photons:
+
+- **Short shutter** = the sensor gets very little light, so a dim IR
+  pen is invisible (frame looks black).
+- **Long shutter** = the sensor accumulates more light, the pen blob
+  is brighter, and the detector can find it.
+
+SMARTIR therefore runs the IR mode with a **long exposure** at startup:
+
+```text
+SMARTIR_EXPOSURE_US (picamera2)  -> default 40000 us (40 ms)
+SMARTIR_V4L2_EXPOSURE (V4L2)     -> default 16   (manual exposure value)
+SMARTIR_GAIN                     -> default 2.0  (analogue gain)
+```
+
+You can override them: `SMARTIR_EXPOSURE_US=80000 python main.py` for a
+very long shutter. The detection threshold in `calibration.py` is also
+**adaptive**: it is a fraction of the frame's own brightness, so a
+dim pen at a high exposure is matched by `max(percentile * 0.5,
+mean * 0.7, 25)` instead of a hard 95/240 floor.
 
 `auto` mode is resolved **once**, when the camera opens.
 
@@ -188,10 +213,15 @@ calibration again.
 SMARTIR_CAM=0               # camera index or stream URL
 SMARTIR_RES=640x480         # capture size (calibration AND detection)
 SMARTIR_FPS=30              # capture framerate
-SMARTIR_EXPOSURE_US=8000    # IR exposure in microseconds (picamera2)
+SMARTIR_EXPOSURE_US=40000   # IR exposure in microseconds (picamera2)
 SMARTIR_GAIN=2.0            # IR analogue gain (picamera2)
-SMARTIR_V4L2_EXPOSURE=10    # IR exposure value for V4L2 drivers
+SMARTIR_V4L2_EXPOSURE=16    # IR exposure value for V4L2 drivers
 ```
+
+These are the **high (long) values** that catch IR light on a low-power
+sensor. The defaults are already the good values; override only if the
+pen is still too dim (e.g. `SMARTIR_EXPOSURE_US=80000` for an even
+longer shutter).
 
 Example (IR pen on a Pi with the camera on the ribbon port):
 

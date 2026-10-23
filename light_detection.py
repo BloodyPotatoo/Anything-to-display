@@ -36,9 +36,11 @@ MAX_AREA = 3000
 # Low-power IR sensor: the pen blob is never as saturated as on a
 # big sensor, so the thresholds are much lower and are computed as
 # a fraction of the frame's own brightness (adaptive).
-# "ir"   -> short exposure + locked gain -> detect the long-wavelength
-#          end of the visible spectrum (deep purple / blue) that the
-#          IR-cut filter lets through + the IR pen.
+# "ir"   -> long exposure (shutter) + locked gain -> catch the
+#          long-wavelength / purple end of the visible spectrum that
+#          the IR-cut filter blocks + the IR pen. The shutter sets
+#          how much light the weak sensor collects, so the threshold
+#          is lowered in step (adaptive).
 # "visible" -> auto exposure -> detect the brightest content.
 IR_RATIO = 0.18
 VISIBLE_RATIO = 0.60

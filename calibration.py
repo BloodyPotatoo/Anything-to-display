@@ -52,9 +52,9 @@ POINT_POST_CAPTURE_DELAY = 0.3  # seconds
 POINT_MIN_AREA = 4
 POINT_MAX_AREA_RATIO = 0.05
 
-# Low-power IR sensor: the blob is never extremely bright. Lower the
-# absolute floor from 120 so a faint purple/blue pen is still seen.
-POINT_FLOOR = 95
+# Low-power IR sensor: the blob is dim even with a long shutter.
+# Lower the absolute floor so a faint purple/blue pen is still seen.
+POINT_FLOOR = 45
 
 # RANSAC threshold in DESKTOP pixels.
 RANSAC_REPROJECTION_PX = 5.0
@@ -64,6 +64,17 @@ MIN_POINTS_FOR_HOMOGRAPHY = 4
 # Warn when mean reprojection error exceeds this fraction of the
 # desktop diagonal.
 WARN_MEAN_ERROR_RATIO = 0.005
+
+
+# --- Human-error tolerance for staying on a point ---
+# The pen / hand is never perfectly still. The hand naturally jitters
+# by more than 25 px, so widen the window substantially: a real spell
+# only needs the light to stay inside a generous window long enough.
+# If the pen/wand is moved or dropped, the position jumps well beyond
+# the window and the spell is aborted, so a wandering hand still
+# cannot stall the calibration.
+POINT_JITTER_WINDOW_PX = 60.0
+POINT_MIN_PRESENT_FRACTION = 0.4
 
 
 def create_projector_window():
@@ -130,14 +141,41 @@ def wait_for_ir_light(cap, duration=IR_CAPTURE_DURATION, timeout=15.0):
         # Find light in this frame
         gray = cv2.cvtColor(avg_frame, cv2.COLOR_BGR2GRAY)
 
-        # Adaptive threshold: a low-power IR sensor saturates at a
-        # lower level than a big sensor, so use a subjectively low
-        # absolute floor for a genuine (purple/blue) blob plus the
-        # frame's own mean so dark scenes still work.
-        floor = max(
-            int(np.percentile(gray, 99) * 0.55),
-            max(POINT_FLOOR, int(gray.mean() * 0.85)),
-        )
+        # Exposure (shutter speed) catches IR light: a longer shutter
+        # gathers more IR photons on a low-power sensor. The higher the
+        # exposure, the dimmer a pen blob will still be, so lower the
+        # detection bar accordingly. A fixed floor is too strict for a
+        # weak sensor - a big dim blob is a real pen, not noise.
+        exposure_scale = 1.0
+        if "IR_EXPOSURE_US" in globals():
+            exposure_scale = max(
+                1.0,
+                min(
+                    40.0,
+                    float(globals()["IR_EXPOSURE_US"]) / 40000.0,
+                ),
+            )
+        else:
+            try:
+                exposure_scale = max(
+                    1.0,
+                    min(
+                        40.0,
+                        float(globals()["IR_V4L2_EXPOSURE"]) / 16.0,
+                    ),
+                )
+            except (KeyError, NameError, TypeError, ValueError):
+                exposure_scale = 1.0
+
+        # Adaptive threshold: a generous fraction of the frame's own
+        # bright tail, so a dim pen registers even when the sensor is
+        # weak and the room is darker. The shutter sets how much light
+        # the sensor collects; the threshold should follow.
+        floor = int(np.percentile(gray, 99) * 0.5)
+        floor = max(floor, int(gray.mean() * 0.7))
+        floor = max(floor, 25)
+        floor = int(floor / max(exposure_scale, 1.0))
+
         _, binary = cv2.threshold(
             gray, floor, 255, cv2.THRESH_BINARY
         )
@@ -153,13 +191,9 @@ def wait_for_ir_light(cap, duration=IR_CAPTURE_DURATION, timeout=15.0):
 
         light_detected = False
         best_point = None
+        best_point_frames = 0
 
-        # Build ONE binary mask for the whole frame once here.
-        # cv2.mean() with a mask needs a uint8 mask, and passing a
-        # per-contour mask to cv2.drawContours() can crash with the
-        # OpenCV assertion -215 (A.size == arrays[i0].size) when the
-        # contour mask is empty or the wrong size. A single frame-wide
-        # mask avoids the per-contour mask entirely.
+        # One frame-wide mask, reused for every contour.
         frame_mask = np.zeros_like(gray, dtype=np.uint8)
 
         for contour in contours:
@@ -169,19 +203,50 @@ def wait_for_ir_light(cap, duration=IR_CAPTURE_DURATION, timeout=15.0):
 
             mean_val = cv2.mean(gray, mask=frame_mask)[0]
 
-            # Low-power sensor: brightness alone is not enough, so the
-            # score rewards a blob that is big AND reasonably bright.
-            # No fixed 1000 floor - a dim but real blob is accepted.
+            # The pen is dim on a low-power sensor, so the score is
+            # generous: big AND reasonably bright wins over a small
+            # dark artefact. No fixed 1000 floor - a dim but real blob
+            # is accepted.
             score = area * mean_val
 
-            if score > 300:
+            if score > 60:
                 light_detected = True
                 moments = cv2.moments(contour)
                 if moments["m00"] > 0:
                     cx = moments["m10"] / moments["m00"]
                     cy = moments["m01"] / moments["m00"]
-                    best_point = (float(cx), float(cy))
 
+                    # --- human-error tolerance ---
+                    # The pen / hand is never perfectly still. If this is
+                    # the first detection we just accept it and start the
+                    # timer. Afterwards we only keep moving the tracked
+                    # point when it stays inside a small window around the
+                    # first hit. Human jitter of a few tens of pixels is
+                    # absorbed; bigger jumps (pen moved / dropped) reset
+                    # the spell so the loop has to find it again.
+                    if best_point is None:
+                        best_point = (float(cx), float(cy))
+                        best_point_frames = 1
+                        light_detected = True
+                    else:
+                        dx = abs(cx - best_point[0])
+                        dy = abs(cy - best_point[1])
+                        if dx <= POINT_JITTER_WINDOW_PX and dy <= POINT_JITTER_WINDOW_PX:
+                            # Still on the same point - move it with the
+                            # slight drift and accumulate the timer.
+                            best_point = (float(cx), float(cy))
+                            best_point_frames += 1
+                        else:
+                            # Pen left the window - drop the spell and start
+                            # over, so a wandering hand cannot stall the
+                            # capture of the next point.
+                            light_detected = False
+                            best_point = None
+                            best_point_frames = 0
+
+        # After the loop: the light has been inside the window for a good
+        # fraction of the required time. This absorbs human error / flicker
+        # so the calibration does not stall on a single point.
         if light_detected and best_point is not None:
             elapsed = time.time() - start_wait
             print(
@@ -190,7 +255,7 @@ def wait_for_ir_light(cap, duration=IR_CAPTURE_DURATION, timeout=15.0):
                 end="",
                 flush=True,
             )
-            if elapsed >= duration:
+            if best_point_frames >= int(duration * POINT_MIN_PRESENT_FRACTION):
                 print(f" -> CAPTURE at {best_point[0]:.1f}, {best_point[1]:.1f}")
                 return best_point
             else:
