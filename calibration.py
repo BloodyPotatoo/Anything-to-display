@@ -3,30 +3,44 @@ import time
 import numpy as np
 import cv2
 
-from camera import open_camera, require_display, resolve_mode, CAMERA_WIDTH, CAMERA_HEIGHT
+from camera import open_camera, require_display, resolve_mode, CAMERA_WIDTH, CAMERA_HEIGHT, IR_EXPOSURE_US, IR_ANALOGUE_GAIN
 from coordinate_mapper import CoordinateMapper
 
 # ============================================================
-# SMARTIR - MANUAL 4-POINT CALIBRATION
+# SMARTIR - MANUAL 9-POINT CALIBRATION WITH AUTO-DETECTION
 # 
-# A simpler calibration that replaces the 2-step RGBW + point-grid
-# sweep with a single pass: 4 points are shown on the projected screen
-# one at a time. The user shines an IR light at each point. The system
-# detects the light position, records the camera coordinate, and after
-# all 4 points are captured it computes a homography and saves the
-# calibration data in the same format used by the rest of the codebase.
+# A calibration that displays a 3x3 grid of points covering the
+# full projected screen. The system auto-detects the IR light when
+# it is present for at least IR_CAPTURE_DURATION seconds, then
+# captures the position. After all 9 points are captured, a homography
+# is computed and saved.
 # ============================================================
 
 CALIBRATION_FILE = "screen_corners.npy"
 HOMOGRAPHY_FILE = "calibration.npz"
 
-# How long to let the camera settle before measuring each point.
-POINT_SETTLE_TIME = 0.30
+# --- Grid configuration ---
+GRID_COLS = 3
+GRID_ROWS = 3
+NUM_POINTS = GRID_COLS * GRID_ROWS  # 9 points
 
-# Frames averaged per measurement (noise reduction).
-POINT_AVERAGE_FRAMES = 8
+# Keep points away from screen edge by this fraction (0 = full edge-to-edge)
+GRID_INSET = 0.0  # Changed from previous 0.07 to cover full screen
 
-# Blob size limits for a reference point, in camera pixels.
+# Point size in projector pixels
+POINT_RADIUS = 20
+
+# --- Auto-detection timing ---
+# Wait this many seconds the light is present before auto-capturing.
+IR_CAPTURE_DURATION = 2.0  # seconds
+
+# How long to show each point before starting the auto-detect timer.
+POINT_DISPLAY_TIME = 0.5  # seconds
+
+# How long to wait after capture before moving to next point.
+POINT_POST_CAPTURE_DELAY = 0.3  # seconds
+
+# --- Blob / detection limits ---
 POINT_MIN_AREA = 4
 POINT_MAX_AREA_RATIO = 0.05
 
@@ -42,9 +56,6 @@ MIN_POINTS_FOR_HOMOGRAPHY = 4
 # Warn when mean reprojection error exceeds this fraction of the
 # desktop diagonal.
 WARN_MEAN_ERROR_RATIO = 0.005
-
-# How long to show each point on the projector before measuring.
-POINT_DISPLAY_DURATION = 1.0  # seconds (minimum before capture starts)
 
 
 def create_projector_window():
@@ -66,7 +77,7 @@ def show_projector_point(window_name, x, y, width, height):
     cv2.circle(
         image,
         (int(round(x)), int(round(y))),
-        16,  # point radius in projector pixels
+        POINT_RADIUS,
         (255, 255, 255),
         -1,
         cv2.LINE_AA,
@@ -75,127 +86,132 @@ def show_projector_point(window_name, x, y, width, height):
     cv2.waitKey(1)
 
 
-def wait_for_enter(timeout=10):
-    """Wait for the user to press ENTER, with a timeout."""
-    import select
-    import tty
-    import termios
+def wait_for_ir_light(cap, duration=IR_CAPTURE_DURATION, timeout=15.0):
+    """Wait for IR light to be present for at least `duration` seconds.
+    Returns the camera coordinates (x, y) when light is detected, or None if timeout.
+    
+    Auto-detection: continuously captures frames and looks for a bright blob.
+    If the light stays present for >= duration seconds, we capture and return.
+    """
+    start_wait = time.time()
+    frames_collected = []
 
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    try:
-        tty.setraw(fd)
-        print(
-            "\nPress ENTER in this terminal to capture this point, "
-            "or wait " + str(timeout) + " seconds to skip.",
-            flush=True,
+    print(
+        f"  Looking for IR light (must be present for {duration:.1f}s, "
+        f"timeout in {timeout:.1f}s)...",
+        flush=True,
+    )
+
+    while True:
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            print("  Camera read error.")
+            return None
+
+        frames_collected.append(frame.astype(np.float32))
+        if len(frames_collected) > 5:
+            frames_collected.pop(0)
+
+        # Average recent frames to reduce noise
+        if len(frames_collected) >= 3:
+            avg_frame = np.mean(frames_collected, axis=0)
+            avg_frame = np.clip(avg_frame, 0, 255).astype(np.uint8)
+        else:
+            avg_frame = frame
+
+        # Find light in this frame
+        gray = cv2.cvtColor(avg_frame, cv2.COLOR_BGR2GRAY)
+        
+        # Threshold - use high value for IR mode
+        _, binary = cv2.threshold(
+            gray, 240, 255, cv2.THRESH_BINARY
         )
-        r, _, _ = select.select([fd], [], [], timeout)
-        if r:
-            ch = sys.stdin.read(1)
-            return ch == "\n" or ch == ""
-        return False
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+        # Morphological clean
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+
+        contours, _ = cv2.findContours(
+            binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        light_detected = False
+        best_point = None
+
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < POINT_MIN_AREA or area > (gray.shape[0] * gray.shape[1] * POINT_MAX_AREA_RATIO):
+                continue
+
+            mean_val = cv2.mean(gray, mask=cv2.drawContours(
+                np.zeros_like(gray), [contour], -1, 255, -1
+            )[1])[0]
+
+            score = area * mean_val
+
+            if score > 1000:  # Minimum score to count as light
+                light_detected = True
+                moments = cv2.moments(contour)
+                if moments["m00"] > 0:
+                    cx = moments["m10"] / moments["m00"]
+                    cy = moments["m01"] / moments["m00"]
+                    best_point = (float(cx), float(cy))
+
+        if light_detected and best_point is not None:
+            elapsed = time.time() - start_wait
+            print(
+                f"  IR light detected! Elapsed: {elapsed:.1f}s "
+                f"(need {duration:.1f}s)",
+                end="",
+                flush=True,
+            )
+            if elapsed >= duration:
+                print(f" -> CAPTURE at {best_point[0]:.1f}, {best_point[1]:.1f}")
+                return best_point
+            else:
+                print(f" ... {elapsed:.1f}s", end="", flush=True)
+        else:
+            # Print a dot to show we're still waiting
+            print(".", end="", flush=True)
+
+        # Check timeout
+        if time.time() - start_wait > timeout:
+            print(" -> Timeout, no light sustained.")
+            return None
+
+        cv2.waitKey(1)
+        time.sleep(0.1)
 
 
 def capture_point_frame(cap, quiet=False):
-    """Capture a single averaged frame from the camera."""
-    frames = []
-
-    for _ in range(POINT_AVERAGE_FRAMES):
-        ret, frame = cap.read()
-        if ret and frame is not None and frame.size:
-            frames.append(frame.astype(np.float32))
-        cv2.waitKey(1)
-        time.sleep(0.02)  # small delay between frames
-
-    if not frames:
-        raise RuntimeError("Could not capture any camera frames.")
-
-    average = np.mean(frames, axis=0)
-    return np.clip(average, 0, 255).astype(np.uint8)
+    """Capture a single frame from the camera."""
+    ret, frame = cap.read()
+    if not ret or frame is None:
+        raise RuntimeError("Could not capture camera frame.")
+    return frame.astype(np.uint8)
 
 
-def find_light_in_frame(frame, roi=None):
-    """Locate the brightest blob in a frame, returning (x, y) or None.
-
-    Searches the full frame (or an optional ROI). Uses Otsu + absolute
-    floor thresholding, then returns the intensity-weighted centroid.
+def build_grid_points(width, height, cols=GRID_COLS, rows=GRID_ROWS, inset=GRID_INSET):
+    """Build reference points at known DESKTOP coordinates.
+    Grid is cols x rows, covering the full screen with optional inset.
+    Row-major, starting top-left.
     """
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
+    points = []
+    cell_w = (width - 2 * inset) / float(cols - 1) if cols > 1 else width
+    cell_h = (height - 2 * inset) / float(rows - 1) if rows > 1 else height
 
-    if roi is not None:
-        x0, y0, x1, y1 = roi
-        x0 = max(0, x0)
-        y0 = max(0, y0)
-        x1 = min(gray.shape[1], x1)
-        y1 = min(gray.shape[0], y1)
-        if x1 <= x0 or y1 <= y0:
-            return None
-        gray = gray[y0:y1, x0:x1]
+    for row in range(rows):
+        for col in range(cols):
+            fx = inset + col * cell_w
+            fy = inset + row * cell_h
+            points.append((fx, fy))
 
-    # Otsu threshold
-    otsu_value, _ = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    threshold_value = max(int(otsu_value), POINT_FLOOR)
-    threshold_value = min(threshold_value, 255)
-
-    binary = cv2.threshold(gray, threshold_value, 255, cv2.THRESH_BINARY)[1]
-
-    # Small morphological clean
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
-
-    contours, _ = cv2.findContours(
-        binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
-
-    if not contours:
-        return None
-
-    region_area = float(gray.shape[0] * gray.shape[1])
-    max_area = region_area * POINT_MAX_AREA_RATIO
-
-    best = None
-    best_score = -1.0
-
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        if area < POINT_MIN_AREA or area > max_area:
-            continue
-
-        # Score = area * mean brightness (higher = better)
-        mean_val = cv2.mean(gray, mask=cv2.drawContours(
-            np.zeros_like(gray), [contour], -1, 255, -1
-        )[1])[0]
-        score = area * mean_val
-
-        if score > best_score:
-            best_score = score
-            best = contour
-
-    if best is None:
-        return None
-
-    # Weighted centroid (sub-pixel quality)
-    moments = cv2.moments(best)
-    if moments["m00"] == 0:
-        return None
-
-    cx = moments["m10"] / moments["m00"]
-    cy = moments["m01"] / moments["m00"]
-
-    # Convert back from ROI if we shifted
-    if roi is not None:
-        x0, y0, _, _ = roi
-        cx += x0
-        cy += y0
-
-    return (float(cx), float(cy))
+    return points
 
 
 def compute_homography(camera_points, desktop_width, desktop_height):
-    """Fit a camera -> desktop homography from exactly 4 point pairs.
+    """Fit a camera -> desktop homography from exactly NUM_POINTS point pairs.
 
     Returns (homography_matrix, mean_error_px) or (None, None) if RANSAC fails.
     """
@@ -203,52 +219,69 @@ def compute_homography(camera_points, desktop_width, desktop_height):
         return None, None
 
     camera_pts = np.asarray(camera_points, dtype=np.float32).reshape(-1, 2)
-    # The four desktop corners in TL, TR, BR, BL order
+
+    # Desktop grid points in TL, TR, BR, BL order for the 3x3 grid
+    # We use the 4 corners of the full desktop for the homography fit
     desktop_pts = np.array(
         [[0, 0], [desktop_width - 1, 0], [desktop_width - 1, desktop_height - 1], [0, desktop_height - 1]],
         dtype=np.float32,
     )
 
-    if len(camera_pts) == 4:
-        # Exact fit when we have exactly 4 points
-        matrix, _ = cv2.findHomography(camera_pts, desktop_pts, 0)
-    else:
-        # RANSAC fit with more than 4 (shouldn't happen but be safe)
+    if len(camera_pts) >= 4:
+        # Use RANSAC with all available points
         matrix, inlier_mask = cv2.findHomography(
             camera_pts, desktop_pts, cv2.RANSAC, RANSAC_REPROJECTION_PX
         )
-        if matrix is None or inlier_mask is None:
-            return None, None
-        inliers = inlier_mask.ravel().astype(bool)
-        camera_pts = camera_pts[inliers]
-        if len(camera_pts) < MIN_POINTS_FOR_HOMOGRAPHY:
+
+        if matrix is None:
             return None, None
 
-    if matrix is None:
-        return None, None
+        matrix = matrix.astype(np.float32)
 
-    matrix = matrix.astype(np.float32)
+        # Compute per-point reprojection errors
+        inliers = inlier_mask.ravel().astype(bool) if inlier_mask is not None else np.ones(len(camera_pts), dtype=bool)
+        camera_pts_in = camera_pts[inliers]
 
-    # Compute per-point reprojection errors
-    projected = cv2.perspectiveTransform(camera_pts.reshape(-1, 1, 2), matrix).reshape(-1, 2)
-    errors = np.linalg.norm(projected - desktop_pts, axis=1)
-    mean_error = float(errors.mean())
+        if len(camera_pts_in) < MIN_POINTS_FOR_HOMOGRAPHY:
+            return None, None
 
-    # Report per-point residuals
-    print("Per-point camera->desktop residuals (px):")
-    for i, err in enumerate(errors):
-        print(f"  point {i + 1}: {err:7.2f} px")
+        projected = cv2.perspectiveTransform(
+            camera_pts_in.reshape(-1, 1, 2), matrix
+        ).reshape(-1, 2)
 
-    print(f"Mean reprojection error: {mean_error:.2f} px")
-    return matrix, mean_error
+        errors = np.linalg.norm(projected - desktop_pts[:len(camera_pts_in)], axis=1)
+        mean_error = float(errors.mean())
+
+        # Report per-point residuals
+        print("Per-point camera->desktop residuals (px):")
+        all_errors = np.linalg.norm(
+            cv2.perspectiveTransform(camera_pts.reshape(-1, 1, 2), matrix).reshape(-1, 2) - desktop_pts, axis=1
+        )
+        for i, err in enumerate(all_errors):
+            marker = "" if inlier_mask is None or inlier_mask.ravel()[i] else " (rejected)"
+            print(f"  point {i + 1}: {err:7.2f}px{marker}")
+
+        print(f"Mean reprojection error: {mean_error:.2f} px")
+        return matrix, mean_error
+    else:
+        # Exact fit with exactly 4 points
+        matrix, _ = cv2.findHomography(camera_pts, desktop_pts, 0)
+        if matrix is None:
+            return None, None
+        matrix = matrix.astype(np.float32)
+        # Compute error
+        projected = cv2.perspectiveTransform(camera_pts.reshape(-1, 1, 2), matrix).reshape(-1, 2)
+        errors = np.linalg.norm(projected - desktop_pts, axis=1)
+        mean_error = float(errors.mean())
+        return matrix, mean_error
 
 
 def save_calibration(camera_corners, homography, frame_width, frame_height,
-                     desktop_width, desktop_height):
+                     screen_width, screen_height):
     """Save calibration data in the formats expected by the codebase.
-
-    - screen_corners.npy : 4 camera-space corners (float32, 4x2)
-    - calibration.npz    : homography, corners, frame/screen sizes
+    
+    Uses screen_width/screen_height keys (not desktop_width/height) so
+    CoordinateMapper can load the calibration.npz directly.
     """
     corners = np.asarray(camera_corners, dtype=np.float32)
     np.save(CALIBRATION_FILE, corners)
@@ -259,8 +292,8 @@ def save_calibration(camera_corners, homography, frame_width, frame_height,
         camera_corners=corners,
         frame_width=int(frame_width),
         frame_height=int(frame_height),
-        desktop_width=int(desktop_width),
-        desktop_height=int(desktop_height),
+        screen_width=int(screen_width),
+        screen_height=int(screen_height),
     )
 
     print("\nSaved:")
@@ -273,12 +306,10 @@ def order_corners_tlbr(points):
     points = np.asarray(points, dtype=np.float32)
     ordered = np.zeros((4, 2), dtype=np.float32)
 
-    # Top-left has smallest sum, bottom-right largest sum
     sums = points.sum(axis=1)
     ordered[0] = points[np.argmin(sums)]  # TL
     ordered[2] = points[np.argmax(sums)]  # BR
 
-    # Top-right has smallest difference (x - y), bottom-left largest
     diffs = points[:, 0] - points[:, 1]
     ordered[1] = points[np.argmin(diffs)]  # TR
     ordered[3] = points[np.argmax(diffs)]  # BL
@@ -291,12 +322,11 @@ def main():
     projector_window = None
 
     try:
-        # Pre-flight: ensure a display is available (instead of letting
-        # the Qt/OpenCV backend abort with no Python traceback).
+        # Pre-flight: ensure a display is available.
         require_display()
 
         print("\n" + "=" * 60)
-        print("SMARTIR MANUAL 4-POINT CALIBRATION")
+        print("SMARTIR MANUAL 9-POINT CALIBRATION (AUTO-DETECT)")
         print("=" * 60)
         print(
             "\nInstructions:"
@@ -306,20 +336,20 @@ def main():
             "onto the screen."
         )
         print(
-            "  2. A white point will appear on the screen one at a time."
+            "  2. A 3x3 grid of points will appear on the screen one at a time."
         )
         print(
-            "  3. Shine the IR pen/light at each point and press ENTER "
-            "when it is centred."
+            "  3. Shine the IR pen/light at each point. The system will "
+            f"auto-detect when the light is present for >= {IR_CAPTURE_DURATION:.1f}s."
         )
         print(
-            "  4. After all 4 points are captured, a homography is "
-            "computed and saved."
+            "  4. After all 9 points are captured, a homography is computed "
+            "and saved."
         )
         print("=" * 60)
 
-        mode = "ir"  # Manual calibration always uses IR mode
-        print(f"\nOpening camera in {mode} mode...")
+        mode = "ir"
+        print(f"\nOpening camera in {mode} mode (IR exposure {IR_EXPOSURE_US}us, gain {IR_ANALOGUE_GAIN}x)...")
         cap, resolved_mode = open_camera(mode)
 
         # Determine the real capture size
@@ -332,8 +362,6 @@ def main():
         print(f"Capture size: {frame_width} x {frame_height}")
 
         # Determine the desktop/projector size.
-        # First try to get it from the coordinate mapper if calibration
-        # data already exists; otherwise ask the user or use a default.
         try:
             mapper = CoordinateMapper()
             screen_width = mapper.screen_width
@@ -343,7 +371,6 @@ def main():
                 f"{screen_width} x {screen_height}"
             )
         except FileNotFoundError:
-            # No existing calibration - ask user for projector resolution
             try:
                 resp = input(
                     "\nEnter the projected screen width (px), "
@@ -359,80 +386,50 @@ def main():
         projector_window = create_projector_window()
 
         # -------------------------------------------------------
-        # COLLECT 4 POINTS
+        # COLLECT 9 POINTS (3x3 grid, full screen coverage)
         # -------------------------------------------------------
         camera_points = []  # (cx, cy) in camera frame coordinates
 
-        names = ["TOP-LEFT", "TOP-RIGHT", "BOTTOM-RIGHT", "BOTTOM-LEFT"]
+        grid_points = build_grid_points(screen_width, screen_height)
 
-        for idx, name in enumerate(names):
+        print(f"\nCalibrating {NUM_POINTS} points (3x3 grid, full {screen_width}x{screen_height})...")
+
+        for idx, (dx, dy) in enumerate(grid_points):
+            point_idx = idx + 1
             print(
                 "\n" + "=" * 50,
-                f"\nPoint {idx + 1}/{4}: {name}",
+                f"\nPoint {point_idx}/{NUM_POINTS}: ({dx:.0f}, {dy:.0f})",
                 "=" * 50,
             )
 
             # Show the point on the projector
-            # Use 1/4 of the screen width/height as a reasonable size
-            # for the point, placed at the corner position.
-            px = screen_width // 4
-            py = screen_height // 4
-
-            # Map the corner to a projector position
-            corner_positions = {
-                "TOP-LEFT": (px, py),
-                "TOP-RIGHT": (screen_width - px, py),
-                "BOTTOM-RIGHT": (screen_width - px, screen_height - py),
-                "BOTTOM-LEFT": (px, screen_height - py),
-            }
-            dx, dy = corner_positions[name]
-
             show_projector_point(projector_window, dx, dy, screen_width, screen_height)
+            time.sleep(POINT_DISPLAY_TIME)
 
-            print(f"  Point position on screen: ({dx}, {dy})")
-            print("  Shine the IR light at the point...")
-            time.sleep(POINT_SETTLE_TIME)
-
-            # Wait for user confirmation
-            print("  Press ENTER when the light is centred on the point.")
-            if not wait_for_enter(timeout=15):
-                print("  Timed out - using whatever position we get.")
-            # Dismiss the projector window between points
-            cv2.destroyWindow(projector_window)
-
-            # Capture a frame and find the light
-            print("  Capturing frame...")
-            frame = capture_point_frame(cap)
-
-            # Find the brightest blob - could be the IR light
-            point = find_light_in_frame(frame)
+            # Auto-detect IR light when present for IR_CAPTURE_DURATION seconds
+            print("  Shine IR light at the point...")
+            point = wait_for_ir_light(cap, duration=IR_CAPTURE_DURATION, timeout=15.0)
 
             if point is not None:
                 cx, cy = point
                 print(f"  Detected light at camera coordinates: ({cx:.1f}, {cy:.1f})")
                 camera_points.append((cx, cy))
             else:
-                print("  !!! No light detected - trying again...")
-                # Try one more frame
-                frame2 = capture_point_frame(cap)
-                point2 = find_light_in_frame(frame2)
-                if point2 is not None:
-                    cx, cy = point2
-                    print(f"  Detected on retry: ({cx:.1f}, {cy:.1f})")
-                    camera_points.append((cx, cy))
-                else:
-                    print("  !!! Still no light detected. Calibration may be inaccurate.")
-                    # Store a placeholder so we still have 4 entries
-                    camera_points.append((frame_width // 2, frame_height // 2))
+                print("  !!! No light detected sustained - using center as placeholder")
+                camera_points.append((frame_width // 2, frame_height // 2))
 
-            # Re-create the projector window for the next point
+            # Small pause before next point
+            time.sleep(POINT_POST_CAPTURE_DELAY)
+
+            # Dismiss and recreate projector window
+            cv2.destroyWindow(projector_window)
             projector_window = create_projector_window()
 
         # -------------------------------------------------------
         # COMPUTE HOMOGRAPHY
         # -------------------------------------------------------
         print("\n" + "=" * 50)
-        print("Computing homography from 4 point correspondences...")
+        print("Computing homography from 9 point correspondences...")
         print("=" * 50)
 
         homography, mean_error = compute_homography(
@@ -441,9 +438,9 @@ def main():
 
         if homography is None:
             raise RuntimeError(
-                "Could not compute a homography from the 4 point "
+                "Could not compute a homography from the 9 point "
                 "correspondences. Make sure the IR light was detected "
-                "at all 4 points and that the camera didn't move."
+                "at enough points and that the camera didn't move."
             )
 
         # Derive the screen corners by inverse-mapping the desktop rectangle
