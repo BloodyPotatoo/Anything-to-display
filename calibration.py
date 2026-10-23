@@ -19,34 +19,41 @@ from coordinate_mapper import CoordinateMapper
 CALIBRATION_FILE = "screen_corners.npy"
 HOMOGRAPHY_FILE = "calibration.npz"
 
-# --- Grid configuration ---
-GRID_COLS = 3
+# --- Grid configuration ---GRID_COLS = 3
 GRID_ROWS = 3
 NUM_POINTS = GRID_COLS * GRID_ROWS  # 9 points
 
 # Keep points away from screen edge by this fraction (0 = full edge-to-edge)
-GRID_INSET = 0.0  # Changed from previous 0.07 to cover full screen
+GRID_INSET = 0.0  # cover full screen edge-to-edge
 
 # Point size in projector pixels
 POINT_RADIUS = 20
 
-# --- Auto-detection timing ---
+# --- Auto-detection timing---
 # Wait this many seconds the light is present before auto-capturing.
-IR_CAPTURE_DURATION = 2.0  # seconds
+# Tolerant: the timer only runs while the light is present, so a
+# noisy/dim sensor never has to hold the threshold for the full 2s
+# in a row - it just has to be ON for at least this long total.
+IR_CAPTURE_DURATION = 2.0  # seconds (light must be ON for this long)
 
 # How long to show each point before starting the auto-detect timer.
 POINT_DISPLAY_TIME = 0.5  # seconds
 
+# How long the auto-detect timer spends waiting for the light per
+# point. After the light has been ON for IR_CAPTURE_DURATION we
+# capture. If the light goes off we keep waiting for a new spell.
+DETECT_TIMEOUT_PER_POINT = 12.0  # seconds
+
 # How long to wait after capture before moving to next point.
 POINT_POST_CAPTURE_DELAY = 0.3  # seconds
 
-# --- Blob / detection limits ---
+# --- Blob / detection limits---
 POINT_MIN_AREA = 4
 POINT_MAX_AREA_RATIO = 0.05
 
-# Absolute brightness floor for a projected point. Prevents dim
-# reflections and ambient IR from being accepted.
-POINT_FLOOR = 120
+# Low-power IR sensor: the blob is never extremely bright. Lower the
+# absolute floor from 120 so a faint purple/blue pen is still seen.
+POINT_FLOOR = 95
 
 # RANSAC threshold in DESKTOP pixels.
 RANSAC_REPROJECTION_PX = 5.0
@@ -121,10 +128,17 @@ def wait_for_ir_light(cap, duration=IR_CAPTURE_DURATION, timeout=15.0):
 
         # Find light in this frame
         gray = cv2.cvtColor(avg_frame, cv2.COLOR_BGR2GRAY)
-        
-        # Threshold - use high value for IR mode
+
+        # Adaptive threshold: a low-power IR sensor saturates at a
+        # lower level than a big sensor, so use a subjectively low
+        # absolute floor for a genuine (purple/blue) blob plus the
+        # frame's own mean so dark scenes still work.
+        floor = max(
+            int(np.percentile(gray, 99) * 0.55),
+            max(POINT_FLOOR, int(gray.mean() * 0.85)),
+        )
         _, binary = cv2.threshold(
-            gray, 240, 255, cv2.THRESH_BINARY
+            gray, floor, 255, cv2.THRESH_BINARY
         )
 
         # Morphological clean
@@ -148,9 +162,12 @@ def wait_for_ir_light(cap, duration=IR_CAPTURE_DURATION, timeout=15.0):
                 np.zeros_like(gray), [contour], -1, 255, -1
             )[1])[0]
 
+            # Low-power sensor: brightness alone is not enough, so the
+            # score rewards a blob that is big AND reasonably bright.
+            # No fixed 1000 floor - a dim but real blob is accepted.
             score = area * mean_val
 
-            if score > 1000:  # Minimum score to count as light
+            if score > 300:
                 light_detected = True
                 moments = cv2.moments(contour)
                 if moments["m00"] > 0:

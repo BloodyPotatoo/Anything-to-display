@@ -33,8 +33,15 @@ MIN_AREA = 3
 MAX_AREA = 3000
 
 # Brightness thresholds per resolved mode.
-IR_THRESHOLD = 240
-VISIBLE_THRESHOLD = 200
+# Low-power IR sensor: the pen blob is never as saturated as on a
+# big sensor, so the thresholds are much lower and are computed as
+# a fraction of the frame's own brightness (adaptive).
+# "ir"   -> short exposure + locked gain -> detect the long-wavelength
+#          end of the visible spectrum (deep purple / blue) that the
+#          IR-cut filter lets through + the IR pen.
+# "visible" -> auto exposure -> detect the brightest content.
+IR_RATIO = 0.18
+VISIBLE_RATIO = 0.60
 
 _KERNEL = None
 
@@ -111,15 +118,27 @@ def find_light(mask, frame, mode="visible"):
     """
     resolved_mode = resolve_mode(mode)
 
-    threshold_val = (
-        IR_THRESHOLD if resolved_mode == "ir" else VISIBLE_THRESHOLD
-    )
-
     # Grayscale directly - skips HSV and saves CPU on the Pi.
+    # For "ir" we detect the long-wavelength / purple end of the
+    # visible spectrum the sensor can actually pass (no IR filter).
     gray = cv2.cvtColor(
         frame,
         cv2.COLOR_BGR2GRAY,
     )
+
+    # Adaptive threshold: a low-power sensor saturates earlier and
+    # the pen is dimmer, so take a generous fraction of the frame's
+    # own bright tail instead of a hard 240. This is what lets a
+    # dim purple-blue pen register without a normal light filter.
+    if resolved_mode == "ir":
+        # Use the frame's own 92nd percentile as the adaptive base:
+        # bright enough to ignore darks, but loose enough to catch
+        # a low-saturation purple pen on a low-power sensor.
+        adaptive = int(np.percentile(gray, 92) * IR_RATIO)
+        threshold_val = max(adaptive, 40)
+    else:
+        threshold_val = int(np.percentile(gray, 80) * VISIBLE_RATIO)
+        threshold_val = max(threshold_val, 30)
 
     _, bright_mask = cv2.threshold(
         gray,
@@ -161,7 +180,9 @@ def find_light(mask, frame, mode="visible"):
         if area < MIN_AREA or area > MAX_AREA:
             continue
 
-        # Score using both area and brightness.
+        # Score using both area and brightness (no hard saturation
+        # threshold). On a low-power sensor the pen is dim, so a small
+        # but consistently bright blob wins over a large dark artefact.
         mean_value = _contour_mean_brightness(gray, contour)
         score = area * mean_value
 
