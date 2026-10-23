@@ -3,8 +3,9 @@ import sys
 import cv2
 import numpy as np
 
-from camera import open_camera, require_display, resolve_mode
+from camera import open_camera, require_display, resolve_mode, preview_window, cleanup_preview
 from coordinate_mapper import CoordinateMapper
+from camera import cleanup_preview
 
 # ============================================================
 # SMARTIR - IR / BRIGHT LIGHT DETECTION
@@ -328,17 +329,33 @@ def run_light_detection(mapper, mode="visible"):
                 detection_mask,
             )
 
+            # Live preview of what the camera sees (only if enabled).
+            if preview_window() is not None:
+                try:
+                    cv2.imshow(
+                        preview_window(),
+                        cv2.resize(
+                            frame,
+                            (int(preview_window_size()[0]), int(preview_window_size()[1])),
+                            interpolation=cv2.INTER_LINEAR,
+                        ),
+                    )
+                except Exception:
+                    pass
+
             if (cv2.waitKey(1) & 0xFF) == ord("q"):
                 break
 
     except KeyboardInterrupt:
-        print("\nDetection interrupted.")
+        cleanup_preview()
+        raise
 
     finally:
         if camera is not None:
             camera.release()
 
         cv2.destroyAllWindows()
+        cleanup_preview()
 
         print("\nDetection stopped.")
 

@@ -2,9 +2,10 @@ import os
 import cv2
 import numpy as np
 
-from camera import open_camera, require_display
+from camera import open_camera, require_display, preview_window, cleanup_preview
 from coordinate_mapper import CoordinateMapper
 from light_detection import make_screen_mask, find_light
+from camera import cleanup_preview
 
 
 # ============================================================
@@ -482,6 +483,20 @@ def main():
             # DISPLAY
             # ------------------------------------------------
 
+            # Live preview of what the camera sees (only if enabled).
+            if preview_window() is not None:
+                try:
+                    cv2.imshow(
+                        preview_window(),
+                        cv2.resize(
+                            frame,
+                            (int(preview_window_size()[0]), int(preview_window_size()[1])),
+                            interpolation=cv2.INTER_LINEAR,
+                        ),
+                    )
+                except Exception:
+                    pass
+
             display = draw_status_bar(
                 canvas,
                 mode,
@@ -553,6 +568,7 @@ def main():
             camera.release()
 
         cv2.destroyAllWindows()
+        cleanup_preview()
 
     print("\nSMARTIR whiteboard stopped.")
 

@@ -46,6 +46,19 @@ DEFAULT_PI_HEIGHT = 480
 DEFAULT_FPS = 30
 
 # ------------------------------------------------------------
+# Camera preview window
+#
+# Show what the camera actually sees while calibrating / tracking.
+# The preview is only a view - detection uses the full-resolution
+# frame, never the downscaled preview.
+#
+# Environment variables:
+#   SMARTIR_PREVIEW        1 = show the preview, 0 = hide (default: 1)
+#   SMARTIR_PREVIEW_RES    WIDTHxHEIGHT of the preview window
+#                          (default: 480x360, capped to the capture size)
+
+
+# ------------------------------------------------------------
 # IR-mode settings (Raspberry Pi NoIR / IR-sensitive cameras).
 #
 # EXPOSURE (shutter speed):
@@ -272,6 +285,51 @@ except ValueError:
     CAMERA_FPS = DEFAULT_FPS
 
 
+def _resolution_from_env(name, default):
+    """Parse a WIDTHxHEIGHT env var, returning the default if unset/invalid."""
+    raw = os.environ.get(name, "").strip().lower()
+
+    if not raw:
+        return default
+
+    try:
+        width_text, height_text = raw.split("x")
+        width = int(width_text)
+        height = int(height_text)
+
+        if width >= 160 and height >= 120:
+            return width, height
+
+        raise ValueError("resolution too small")
+    except ValueError:
+        print(
+            f"WARN: ignoring {name}={raw} "
+            f"(expected WIDTHxHEIGHT, e.g. 640x480); using {default[0]}x{default[1]}"
+        )
+        return default
+
+
+_PREVIEW_ENABLED = os.environ.get("SMARTIR_PREVIEW", "1").strip().lower() in ("1", "true", "yes", "on")
+
+if _PREVIEW_ENABLED:
+    _PREVIEW_RES = _resolution_from_env("SMARTIR_PREVIEW_RES", (480, 360))
+    _PREVIEW_WIDTH, _PREVIEW_HEIGHT = _PREVIEW_RES
+else:
+    _PREVIEW_WIDTH = _PREVIEW_HEIGHT = None
+
+
+def preview_enabled():
+    """True when the camera preview window is active."""
+    return _PREVIEW_ENABLED
+
+
+def preview_size():
+    """The preview window size (width, height), or None when disabled."""
+    if not _PREVIEW_ENABLED:
+        return None
+    return (_PREVIEW_WIDTH, _PREVIEW_HEIGHT)
+
+
 def resolve_mode(mode="auto"):
     """
     Map a requested mode onto a concrete one.
@@ -444,7 +502,52 @@ class PiCameraStream:
 
         return 0.0
 
-    def release(self):
+
+def create_preview_window(window_name, width, height):
+    """
+    Create a small live preview window.
+
+    The preview is only a view of the camera; detection works on the
+    full-resolution frame, so the preview never limits detection.
+    """
+    if width <= 0 or height <= 0:
+        return None
+
+    cv2.namedWindow(
+        window_name,
+        cv2.WINDOW_NORMAL,
+        cv2.WINDOW_KEEPRATIO,
+    )
+
+    cv2.resizeWindow(window_name, width, height)
+    cv2.setWindowProperty(
+        window_name,
+        cv2.WND_PROP_FULLSCREEN,
+        cv2.WINDOW_FULLSCREEN,
+    )
+
+    return window_name
+
+
+def draw_preview(window_name, frame, width, height):
+    """
+    Draw the full-resolution frame into a downscaled preview window.
+
+    Only runs between frames; the preview is not part of the
+    detection pipeline.
+    """
+    if not _PREVIEW_ENABLED:
+        return
+
+    try:
+        preview = cv2.resize(frame, (width, height), interpolation=cv2.INTER_LINEAR)
+        cv2.imshow(window_name, preview)
+    except Exception:
+        pass
+
+
+class PiCameraStream:
+    def __init__(self, width, height, fps, mode):
         if not self._opened:
             return
 
@@ -696,6 +799,16 @@ def open_camera(mode="visible"):
         )
 
         if stream is not None:
+            # Start a small live preview of what the camera sees.
+            if _PREVIEW_ENABLED:
+                if "_PREVIEW_WINDOW" in globals():
+                    del _PREVIEW_WINDOW
+                _PREVIEW_WINDOW = create_preview_window(
+                    "SMARTIR Camera Preview",
+                    _PREVIEW_WIDTH,
+                    _PREVIEW_HEIGHT,
+                )
+
             return stream, resolved_mode
 
         if is_raspberry_pi():
@@ -732,7 +845,29 @@ def open_camera(mode="visible"):
         )
 
         if cap is not None:
+            # Start a small live preview of what the camera sees.
+            if _PREVIEW_ENABLED:
+                if "_PREVIEW_WINDOW" in globals():
+                    del _PREVIEW_WINDOW
+                _PREVIEW_WINDOW = create_preview_window(
+                    "SMARTIR Camera Preview",
+                    _PREVIEW_WIDTH,
+                    _PREVIEW_HEIGHT,
+                )
+
             return cap, resolved_mode
+
+    # --------------------------------------------------------
+    # 4. Show the preview alongside the camera
+    # --------------------------------------------------------
+    if _PREVIEW_ENABLED:
+        if "_PREVIEW_WINDOW" in globals():
+            del _PREVIEW_WINDOW
+        _PREVIEW_WINDOW = create_preview_window(
+            "SMARTIR Camera Preview",
+            _PREVIEW_WIDTH,
+            _PREVIEW_HEIGHT,
+        )
 
     raise RuntimeError(
         "No usable camera found.\n"
@@ -741,3 +876,29 @@ def open_camera(mode="visible"):
         "  - USB camera: check that /dev/video* exists (ls /dev/video*).\n"
         "  - Or set the source explicitly: SMARTIR_CAM=0 python main.py"
     )
+
+
+# ============================================================
+# LIVE PREVIEW
+#
+# The preview window shows what the camera actually sees. It is only
+# a view: detection always works on the full-resolution frame, so
+# the preview never slows down or lowers detection quality.
+# ============================================================
+
+_PREVIEW_WINDOW = None
+
+
+def preview_window():
+    """Return the preview window name, or None when hidden."""
+    return _PREVIEW_WINDOW
+
+
+def cleanup_preview():
+    """Close the preview window when the app exits."""
+    global _PREVIEW_WINDOW
+
+    if _PREVIEW_WINDOW is not None:
+        cv2.destroyWindow(_PREVIEW_WINDOW)
+        _PREVIEW_WINDOW = None
+
