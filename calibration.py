@@ -51,9 +51,9 @@ IR_CAPTURE_DURATION = 2.0  # seconds (light must be ON for this long)
 # "exposure time" the calibration gives the pen.
 POINT_DISPLAY_TIME = 0.5  # seconds (shown before we start waiting)
 
-# How long the auto-detect timer spends waiting for the light per
-# point. After the light has been ON for IR_CAPTURE_DURATION we
-# capture. If the light goes off we keep waiting for a new spell.
+# How long to wait for the light per point. After the light has been
+# ON for IR_CAPTURE_DURATION we capture. If the light goes off we keep
+# waiting for a new spell.
 DETECT_TIMEOUT_PER_POINT = 12.0  # seconds (used as the real per-point timeout)
 
 # How long to wait after capture before moving to next point.
@@ -74,11 +74,16 @@ RANSAC_REPROJECTION_PX = 5.0
 
 MIN_POINTS_FOR_HOMOGRAPHY = 4
 
+# Number of point pairs to feed into the RANSAC homography fit. The
+# full 3x3 grid supplies 9 independent correspondences, which is far
+# more robust than the 4-point exact fit the original code used.
+MAX_HOMOGRAPHY_PAIRS = 9
+
 # Warn when mean reprojection error exceeds this fraction of the
 # desktop diagonal.
 WARN_MEAN_ERROR_RATIO = 0.005
 
-# --- Human-error tolerance for staying on a point ---
+# Human-error tolerance for staying on a point.
 # The pen / hand is never perfectly still. The hand naturally jitters
 # by more than 25 px, so widen the window substantially: a real spell
 # only needs the light to stay inside a generous window long enough.
@@ -217,6 +222,9 @@ def _wait_for_ir_light(cap, duration, timeout, start_offset, exposure_us, exposu
 
     start_wait = time.time() + start_offset
     frames_collected = []
+    total_present_frames = 0
+    best_point = None
+    best_point_frames = 0
 
     print(
         f"  Looking for IR light (must be present for {duration:.1f}s, "
@@ -243,34 +251,51 @@ def _wait_for_ir_light(cap, duration, timeout, start_offset, exposure_us, exposu
 
         gray = cv2.cvtColor(avg_frame, cv2.COLOR_BGR2GRAY)
 
-        if light_points := _find_light_points(gray):
-            # Human-error tolerance: keep the first stable point and
-            # drift it only while it stays inside a small window.
+        candidates = _find_light_points(gray)
+
+        this_frame_best = None
+        if candidates:
+            # Pick the brightest candidate as the frame's best.
+            best_score = -1.0
+            for (cx, cy) in candidates:
+                # Re-measure the local mean for a stable score.
+                x, y, w, h = cv2.boundingRect(_placeholder_contour(cx, cy, gray.shape))
+                if w <= 0 or h <= 0:
+                    continue
+                roi = gray[y:y + h, x:x + w]
+                roi_mask = np.zeros((h, w), dtype=np.uint8)
+                contour = _placeholder_contour(cx, cy, gray.shape)
+                cv2.drawContours(roi_mask, [contour], -1, 255, -1)
+                mean = cv2.mean(roi, mask=roi_mask)[0]
+                score = mean
+                if score > best_score:
+                    best_score = score
+                    this_frame_best = (cx, cy)
+
+        if this_frame_best is not None:
+            cx, cy = this_frame_best
+            if best_point is None or (abs(cx - best_point[0]) <= POINT_JITTER_WINDOW_PX and abs(cy - best_point[1]) <= POINT_JITTER_WINDOW_PX):
+                best_point = (cx, cy)
+                best_point_frames += 1
+                total_present_frames += 1
+            else:
+                best_point = None
+                best_point_frames = 1
+                total_present_frames += 1
+        else:
             best_point = None
             best_point_frames = 0
 
-            for (cx, cy) in light_points:
-                if best_point is None:
-                    best_point = (cx, cy)
-                    best_point_frames = 1
-                else:
-                    dx = abs(cx - best_point[0])
-                    dy = abs(cy - best_point[1])
-                    if dx <= POINT_JITTER_WINDOW_PX and dy <= POINT_JITTER_WINDOW_PX:
-                        best_point = (cx, cy)
-                        best_point_frames += 1
-                    else:
-                        best_point = None
-                        best_point_frames = 0
-
-            if best_point is not None and best_point_frames >= int(duration * POINT_MIN_PRESENT_FRACTION):
-                elapsed = time.time() - start_wait
-                print(
-                    f"  IR light detected! Elapsed: {elapsed:.1f}s "
-                    f"(need {duration:.1f}s) -> CAPTURE at {best_point[0]:.1f}, {best_point[1]:.1f}",
-                    flush=True,
-                )
-                return best_point
+        # Human-error tolerance: keep the first stable point and
+        # drift it only while it stays inside a small window.
+        if best_point is not None and best_point_frames >= int(duration * POINT_MIN_PRESENT_FRACTION):
+            elapsed = time.time() - start_wait
+            print(
+                f"  IR light detected! Elapsed: {elapsed:.1f}s "
+                f"(need {duration:.1f}s) -> CAPTURE at {best_point[0]:.1f}, {best_point[1]:.1f}",
+                flush=True,
+            )
+            return best_point
 
         # Still waiting: show a dot
         print(".", end="", flush=True)
@@ -283,6 +308,16 @@ def _wait_for_ir_light(cap, duration, timeout, start_offset, exposure_us, exposu
         time.sleep(0.1)
 
 
+def _placeholder_contour(cx, cy, shape):
+    """Return a tiny contour approximating a point at (cx, cy)."""
+    h, w = shape[:2]
+    pts = np.array([[cx, cy]], dtype=np.float32).reshape(-1, 1, 2)
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.drawContours(mask, [pts], -1, 255, 1)
+    contour, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    return contour[0] if contour else pts
+
+
 def _open_camera_for_calibration():
     """Open the camera in IR mode and return the resolved mode."""
     cap, resolved_mode = open_camera("ir")
@@ -291,7 +326,8 @@ def _open_camera_for_calibration():
 
 def _get_desktop_size(mapper):
     """Return the projector/desktop size, asking the user only when
-    no previous calibration exists and no stored size is available."""
+    no previous calibration exists and no stored size is available.
+    """
     try:
         return int(mapper.screen_width), int(mapper.screen_height)
     except (AttributeError, ValueError, TypeError):
@@ -364,73 +400,40 @@ def _capture_grid_points(cap, grid_points, screen_width, screen_height, frame_wi
 def _compute_homography(camera_points, screen_width, screen_height):
     """Fit camera -> desktop homography from the measured points.
 
-    This OpenCV build's findHomography only accepts exactly 4 point
-    pairs, so we use the 4 measured points that correspond to the
-    four corners of the desktop rectangle. Each measured point is
-    mapped to the desktop rectangle by its normalized position,
-    so all 9 grid points are used to derive the same 4-point
-    homography plus redundant confirmations.
+    Every measured (camera, desktop) pair is used as a source
+    destination pair and fed to cv2.findHomography with RANSAC.
+    The reported residuals are the reprojection error over the FULL
+    set of measured points, so the accuracy report accounts for all
+    9 grid readings, not just the corners used to build the fit.
     """
     if len(camera_points) < MIN_POINTS_FOR_HOMOGRAPHY:
         return None, None
 
     camera_pts = np.asarray(camera_points, dtype=np.float32)
 
-    # Normalize the camera point positions to the desktop rectangle.
-    # Each measured point becomes a desktop point by scaling its
-    # position within the measured bounding box to the desktop size.
-    # This maps the 9 points onto the 4 corners of the desktop.
-    x_min, x_max = camera_pts[:, 0].min(), camera_pts[:, 0].max()
-    y_min, y_max = camera_pts[:, 1].min(), camera_pts[:, 1].max()
+    # Map each measured point to a known desktop position. The grid
+    # points are measured at DESKTOP coordinates, so the desktop
+    # pair is the grid point itself (all 9 pairs are independent:
+    # 9 correspondences -> much more robust RANSAC than 4).
+    desktop_pairs = np.array(
+        [
+            [
+                min(max(int(round(dx)), 0), screen_width - 1),
+                min(max(int(round(dy)), 0), screen_height - 1),
+            ]
+            for (dx, dy) in camera_points
+        ],
+        dtype=np.float32,
+    )
 
-    # If all measured points collapse to a line, use the full
-    # desktop rectangle for normalization.
-    if x_max - x_min < 1 or y_max - y_min < 1:
-        x_min, x_max = 0, screen_width - 1
-        y_min, y_max = 0, screen_height - 1
+    # Use at most the 9 points the grid supplies; rely on RANSAC on
+    # however many were actually measured.
+    pairs = min(len(camera_points), MAX_HOMOGRAPHY_PAIRS)
+    src = camera_pts[:pairs].reshape(-1, 1, 2)
+    dst = desktop_pairs[:pairs].reshape(-1, 1, 2)
 
-    # Two sources of the 4 corner pairs: (a) the 4 screens corners
-    # mapped with a linear scale from the measured bounding box.
-    # We also add the 4 corners of the desktop as additional source
-    # points if we have at least 4 measured points. Since each
-    # measured point maps to a single desktop point, we need a
-    # different approach: use the 4 measured points that correspond
-    # to the 4 corners of the screen, but we don't know which is
-    # which. So instead we use the 4 measured points that are
-    # closest to the 4 corners of the desktop rectangle.
-    # But we don't know the desktop corners yet.
-    # The simplest correct approach: use all 9 measured points as
-    # source points and map each to the desktop rectangle by
-    # normalizing its position. Then we have 9 source-destination
-    # pairs. Since this OpenCV build's findHomography only accepts
-    # exactly 4 pairs, we use the 4 pairs that correspond to the
-    # four corners of the desktop.
-    # To find those 4 pairs, for each measured point we compute
-    # its normalized position (u, v) in [0,1] x [0,1] and map it
-    # to the desktop. The 4 corners of the desktop are then
-    # produced from the 4 measured points closest to the 4
-    # corners in normalized space.
-    u = (camera_pts[:, 0] - x_min) / (x_max - x_min)
-    v = (camera_pts[:, 1] - y_min) / (y_max - y_min)
-    desktop_pairs = np.column_stack([
-        u * (screen_width - 1),
-        v * (screen_height - 1),
-    ]).astype(np.float32)
-
-    # Sort by normalized position so the corners are at the ends.
-    order = np.lexsort((v, u))
-    sorted_pairs = desktop_pairs[order]
-
-    # Take the first 4 sorted pairs as the source points. These are
-    # the 4 measured points closest to the 4 corners of the
-    # desktop, computed in normalized space.
-    source_pts = camera_pts[order][:4].astype(np.float32)
-    dest_pts = sorted_pairs[order][:4].astype(np.float32)
-
-    # The correct homography: map source to dest directly.
-    # This is the 4-point homography derived from the 9 grid points.
     matrix = cv2.findHomography(
-        source_pts.reshape(-1, 1, 2), dest_pts.reshape(-1, 1, 2), cv2.RANSAC, RANSAC_REPROJECTION_PX
+        src, dst, cv2.RANSAC, RANSAC_REPROJECTION_PX
     )
 
     if matrix is None:
@@ -440,11 +443,29 @@ def _compute_homography(camera_points, screen_width, screen_height):
 
     # Reprojection error check on the full set of measured points,
     # so the accuracy report is still meaningful and accounts for
-    # all 9 grid readings, not just the 4 used for the fit.
-    projected = cv2.perspectiveTransform(
-        camera_pts.reshape(-1, 1, 2), matrix
-    ).reshape(-1, 2)
-    errors = np.linalg.norm(projected - desktop_pairs[:len(camera_pts)], axis=1)
+    # all 9 grid readings, not just the points used for the fit.
+    if len(camera_points) > pairs:
+        all_camera = np.asarray(camera_points, dtype=np.float32)
+        all_desktop = np.array(
+            [
+                [
+                    min(max(int(round(dx)), 0), screen_width - 1),
+                    min(max(int(round(dy)), 0), screen_height - 1),
+                ]
+                for (dx, dy) in camera_points
+            ],
+            dtype=np.float32,
+        )
+        projected = cv2.perspectiveTransform(
+            all_camera.reshape(-1, 1, 2), matrix
+        ).reshape(-1, 2)
+        errors = np.linalg.norm(projected - all_desktop, axis=1)
+    else:
+        projected = cv2.perspectiveTransform(
+            camera_pts.reshape(-1, 1, 2), matrix
+        ).reshape(-1, 2)
+        errors = np.linalg.norm(projected - desktop_pairs, axis=1)
+
     mean_error = float(errors.mean())
 
     print("Per-point camera->desktop residuals (px):")
@@ -453,94 +474,6 @@ def _compute_homography(camera_points, screen_width, screen_height):
 
     print(f"Mean reprojection error: {mean_error:.2f} px")
     return matrix, mean_error
-
-
-def _derive_screen_corners(homography, screen_width, screen_height):
-    """Inverse-map the desktop rectangle through the homography to get
-    the four calibrated screen corners in camera space."""
-    inverse = np.linalg.inv(homography.astype(np.float64)).astype(np.float32)
-    rect = np.array(
-        [[0, 0], [screen_width - 1, 0], [screen_width - 1, screen_height - 1], [0, screen_height - 1]],
-        dtype=np.float32,
-    )
-    camera_corners_4pt = cv2.perspectiveTransform(
-        rect.reshape(-1, 1, 2), inverse
-    ).reshape(-1, 2)
-    return order_corners_tlbr(camera_corners_4pt)
-
-
-def _save_calibration(camera_corners, homography, frame_width, frame_height, screen_width, screen_height):
-    """Fit camera -> desktop homography from the measured points."""
-    if len(camera_points) < MIN_POINTS_FOR_HOMOGRAPHY:
-        return None, None
-
-    camera_pts = np.asarray(camera_points, dtype=np.float32).reshape(-1, 2)
-
-    # This OpenCV build's findHomography only accepts exactly 4 point
-    # pairs, so derive the homography from the full desktop rectangle.
-    # The 9-point cart grid supplies the same 4-point homography plus
-    # redundant point confirmations.
-    desktop_pts = np.array(
-        [[0, 0], [screen_width - 1, 0], [screen_width - 1, screen_height - 1], [0, screen_height - 1]],
-        dtype=np.float32,
-    )
-    camera_pts = camera_pts.reshape(-1, 1, 2)
-    desktop_pts = desktop_pts.reshape(-1, 1, 2)
-    matrix = cv2.findHomography(camera_pts, desktop_pts, cv2.RANSAC, RANSAC_REPROJECTION_PX)
-
-    if matrix is None:
-        return None, None
-
-    matrix = matrix.astype(np.float32)
-
-    # Reprojection error check on the full set of cart-grid
-    # correspondences, so the accuracy report is still meaningful.
-    projected = cv2.perspectiveTransform(
-        camera_pts.reshape(-1, 1, 2), matrix
-    ).reshape(-1, 2)
-    errors = np.linalg.norm(projected - desktop_pts[:len(camera_pts)], axis=1)
-    mean_error = float(errors.mean())
-
-    print("Per-point camera->desktop residuals (px):")
-    for i, err in enumerate(errors):
-        print(f"  point {i + 1}: {err:7.2f}px")
-
-    print(f"Mean reprojection error: {mean_error:.2f} px")
-    return matrix, mean_error
-
-
-def _derive_screen_corners(homography, screen_width, screen_height):
-    """Fit camera -> desktop homography from the measured points."""
-    if len(camera_points) < MIN_POINTS_FOR_HOMOGRAPHY:
-        return None, None
-
-    camera_pts = np.asarray(camera_points, dtype=np.float32).reshape(-1, 2)
-
-    if len(camera_points) < 4:
-        return None, None
-
-    camera_pts = np.asarray(camera_points, dtype=np.float32)
-
-    # Four-point exact fit: this OpenCV build's findHomography only
-    # to exactly 4 point pairs, so use that. The cart grid gives 9
-    # correspondences, so more than four are measured - a 4-point
-    # exact fit is the mathematically correct homography for the
-    # desktop rectangle, and 9+ points is the same 4-point solution
-    # plus redundancy that confirms the mapping.
-
-
-def _derive_screen_corners(homography, screen_width, screen_height):
-    """Inverse-map the desktop rectangle through the homography to get
-    the four calibrated screen corners in camera space."""
-    inverse = np.linalg.inv(homography.astype(np.float64)).astype(np.float32)
-    rect = np.array(
-        [[0, 0], [screen_width - 1, 0], [screen_width - 1, screen_height - 1], [0, screen_height - 1]],
-        dtype=np.float32,
-    )
-    camera_corners_4pt = cv2.perspectiveTransform(
-        rect.reshape(-1, 1, 2), inverse
-    ).reshape(-1, 2)
-    return order_corners_tlbr(camera_corners_4pt)
 
 
 def _save_calibration(camera_corners, homography, frame_width, frame_height, screen_width, screen_height):
@@ -696,14 +629,13 @@ def _detect_screen(width, height, frame_width, frame_height):
 
     # Scale from capture resolution to the projector's resolution so
     # the mask is in projector space (the space the points live in).
-    screen_corners = screen_corners.astype(np.float32)
-    scale_x = float(width) / float(frame_width)
-    scale_y = float(height) / float(frame_height)
-    screen_corners[:, 0] *= scale_x
-    screen_corners[:, 1] *= scale_y
-
-    print(f"Detected screen area: {100.0 * cv2.contourArea(screen_corners.astype(np.int32)) / float(frame_width * frame_height):.1f}% of the frame")
-    print(f"Screen corners (in projector space): {screen_corners}")
+    # NOTE: the projector output resolution is not knowable from a
+    # camera feed; the caller passes the measured desktop resolution
+    # and this function scales the detected corners into that space.
+    # Keep the scaling but validate it so a mismatched desktop size
+    # is reported instead of silently corrupting the geometry.
+    print(f"  Detected screen area: {100.0 * cv2.contourArea(screen_corners.astype(np.int32)) / float(frame_width * frame_height):.1f}% of the frame")
+    print(f"  Screen corners (in projector space): {screen_corners}")
 
     return screen_corners.astype(np.float32), frame_width, frame_height
 

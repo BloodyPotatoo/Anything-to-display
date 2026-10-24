@@ -609,6 +609,13 @@ def _try_libcamera_gstreamer(resolved_mode):
             "for correct IR behaviour."
         )
 
+    # The libcamerasrc (libcamera) stack on Raspberry Pi reports
+    # resolutions differently from OpenCV: asking for the full
+    # CAMERA_WIDTH/CAMERA_HEIGHT often fails, and a successful read
+    # arrives at an unsupported aspect ratio. Try the configured
+    # resolution first, then a smaller safe value. The camera is
+    # re-validated after opening, so a fallback is reported instead
+    # of silently passing a mismatched frame.
     pipelines = [
         f"libcamerasrc ! video/x-raw, width={CAMERA_WIDTH}, "
         f"height={CAMERA_HEIGHT}, framerate={CAMERA_FPS}/1 ! "

@@ -5,7 +5,6 @@ import numpy as np
 
 from camera import open_camera, require_display, resolve_mode, preview_window, cleanup_preview
 from coordinate_mapper import CoordinateMapper
-from camera import cleanup_preview
 
 # ============================================================
 # SMARTIR - IR / BRIGHT LIGHT DETECTION

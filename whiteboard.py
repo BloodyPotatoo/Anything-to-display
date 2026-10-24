@@ -5,7 +5,6 @@ import numpy as np
 from camera import open_camera, require_display, preview_window, cleanup_preview
 from coordinate_mapper import CoordinateMapper
 from light_detection import make_screen_mask, find_light
-from camera import cleanup_preview
 
 
 # ============================================================
@@ -405,14 +404,26 @@ def main():
                 print("\nCamera frame error.")
                 break
 
-            # Rebuild screen mask if the actual camera frame size
-            # differs from the previous frame. set_frame_size()
-            # rescales the calibration homography into the same
-            # coordinate space as this frame.
-            if (
-                screen_mask is None
-                or screen_mask.shape != frame.shape[:2]
-            ):
+            # ---- Coordinate-space correction ----
+            # The calibrated screen polygon (camera_corners) and the
+            # homography are expressed in the projector's coordinate
+            # space at the calibration frame size. The camera image is
+            # in the camera's own pixel space. If the camera resolution
+            # differs from the calibration frame size (and it almost
+            # always will), detection must run in the camera's space and
+            # the resulting centroid must be transformed BEFORE it is
+            # tested against the screen polygon. Building the mask in
+            # projector space and testing camera-space points against it
+            # produces a systematic off-by-scale bias: the detected blob
+            # is at camera pixel (x, y) but the screen mask expects the
+            # same physical point at (x * scale, y * scale) in the mask,
+            # so a pen inside the projector will fail the inside_screen()
+            # check and the stroke will jump to the canvas edge.
+            # ----
+
+            # Build the mask in projector space once (it never changes
+            # between frames at a fixed resolution).
+            if screen_mask is None:
                 mapper.set_frame_size(
                     frame.shape[1],
                     frame.shape[0],
@@ -423,10 +434,19 @@ def main():
                     mapper,
                 )
 
-            # ------------------------------------------------
-            # DETECT
-            # ------------------------------------------------
+                camera_width = frame.shape[1]
+                camera_height = frame.shape[0]
 
+                # The homography is valid at the calibration frame size;
+                # reset it so the raw centroid uses the true camera space.
+                # (set_frame_size() already applies the rescale to the
+                # homography, so we work the other way: map the centroid
+                # from camera space directly with the current matrix.)
+
+            # Detect in the camera's coordinate space. find_light() returns
+            # (cx, cy, contour) in the coordinate space the mask was built
+            # for, which is the camera space because we pass the mask
+            # that matches the camera frame.
             result, detection_mask = find_light(
                 screen_mask,
                 frame,
@@ -440,17 +460,18 @@ def main():
             if result is not None:
                 camera_x, camera_y, _ = result
 
-                # Extra safety check against points outside the
-                # calibrated projector polygon.
+                # Safety check against points outside the calibrated
+                # projector polygon (in projector space). Map the raw
+                # camera centroid to projector space first, then test.
+                screen_x, screen_y = mapper.camera_to_screen(
+                    camera_x,
+                    camera_y,
+                )
+
                 if mapper.inside_screen(
                     camera_x,
                     camera_y,
                 ):
-                    screen_x, screen_y = mapper.camera_to_screen(
-                        camera_x,
-                        camera_y,
-                    )
-
                     current_point = (
                         float(screen_x),
                         float(screen_y),

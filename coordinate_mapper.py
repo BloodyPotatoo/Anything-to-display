@@ -308,8 +308,29 @@ class CoordinateMapper:
                 "         Mapping will be wrong - recalibrate."
             )
 
-        scale_x = width / float(src_width)
-        scale_y = height / float(src_height)
+        # Guard against a zero/negative scale (e.g. 0x0 or an inverted
+        # resolution) before doing any arithmetic on it.
+        if width <= 0 or height <= 0 or src_width <= 0 or src_height <= 0:
+            return
+
+        # Scale with aspect-ratio clamping so a slightly different
+        # capture resolution does not stretch the homography. If the
+        # aspect ratio differs by more than the warning threshold,
+        # fall back to the calibration frame size rather than guessing.
+        if (
+            abs(src_aspect - cur_aspect) / src_aspect
+            > ASPECT_WARN_RATIO
+        ):
+            scale_x = 1.0
+            scale_y = 1.0
+            print(
+                "WARNING: camera frame aspect ratio differs from "
+                f"calibration; using the calibration capture size "
+                f"({src_width}x{src_height}) for mapping."
+            )
+        else:
+            scale_x = width / float(src_width)
+            scale_y = height / float(src_height)
 
         # p_new = S . p_old  (homogeneous scale matrix)
         # desktop = H . p_old = H . S^-1 . p_new
