@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 
 from calibration import (
-    _detect_screen,
+    _screen_corners_from_frames,
     _find_light_points,
     _resolve_exposure_scale,
     build_grid_points,
@@ -51,17 +51,13 @@ def test_detect_screen_with_synthetic_projector_frame():
         frame[330:400, 50:100] = (80, 80, 80)
         frames.append(frame)
 
-    corners, capture_w, capture_h = _detect_screen(
-        width, height, frames[0].shape[1], frames[0].shape[0]
-    )
+    corners = _screen_corners_from_frames(frames, width, height)
 
     assert corners.shape == (4, 2)
     xs = corners[:, 0]
     ys = corners[:, 1]
     assert xs.min() < 300 and xs.max() > 340
     assert ys.min() < 250 and ys.max() > 290
-    assert capture_w == width
-    assert capture_h == height
 
 
 if __name__ == "__main__":

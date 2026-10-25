@@ -2,7 +2,13 @@ import os
 import cv2
 import numpy as np
 
-from camera import open_camera, require_display, preview_window, cleanup_preview
+from camera import (
+    open_camera,
+    require_display,
+    preview_size,
+    preview_window,
+    cleanup_preview,
+)
 from coordinate_mapper import CoordinateMapper
 from light_detection import make_screen_mask, find_light
 
@@ -214,10 +220,8 @@ def draw_status_bar(
 def make_debug_frame(
     frame,
     mapper,
-    screen_mask,
     result,
     detection_mask,
-    mode,
 ):
     """
     Optional camera debug view.
@@ -404,26 +408,13 @@ def main():
                 print("\nCamera frame error.")
                 break
 
-            # ---- Coordinate-space correction ----
-            # The calibrated screen polygon (camera_corners) and the
-            # homography are expressed in the projector's coordinate
-            # space at the calibration frame size. The camera image is
-            # in the camera's own pixel space. If the camera resolution
-            # differs from the calibration frame size (and it almost
-            # always will), detection must run in the camera's space and
-            # the resulting centroid must be transformed BEFORE it is
-            # tested against the screen polygon. Building the mask in
-            # projector space and testing camera-space points against it
-            # produces a systematic off-by-scale bias: the detected blob
-            # is at camera pixel (x, y) but the screen mask expects the
-            # same physical point at (x * scale, y * scale) in the mask,
-            # so a pen inside the projector will fail the inside_screen()
-            # check and the stroke will jump to the canvas edge.
-            # ----
-
-            # Build the mask in projector space once (it never changes
-            # between frames at a fixed resolution).
-            if screen_mask is None:
+            # ---- Coordinate space ----
+            # set_frame_size() rescales the screen polygon and the
+            # homography to the camera's actual frame size, so the
+            # mask, the detected centroid, and inside_screen() all use
+            # the same camera-pixel space. camera_to_screen() converts
+            # the centroid to desktop/projector space for drawing.
+            if screen_mask is None or screen_mask.shape != frame.shape[:2]:
                 mapper.set_frame_size(
                     frame.shape[1],
                     frame.shape[0],
@@ -433,15 +424,6 @@ def main():
                     frame.shape,
                     mapper,
                 )
-
-                camera_width = frame.shape[1]
-                camera_height = frame.shape[0]
-
-                # The homography is valid at the calibration frame size;
-                # reset it so the raw centroid uses the true camera space.
-                # (set_frame_size() already applies the rescale to the
-                # homography, so we work the other way: map the centroid
-                # from camera space directly with the current matrix.)
 
             # Detect in the camera's coordinate space. find_light() returns
             # (cx, cy, contour) in the coordinate space the mask was built
@@ -507,13 +489,16 @@ def main():
             # ------------------------------------------------
 
             # Live preview of what the camera sees (only if enabled).
-            if preview_window() is not None:
+            preview_name = preview_window()
+            preview_dims = preview_size()
+
+            if preview_name is not None and preview_dims is not None:
                 try:
                     cv2.imshow(
-                        preview_window(),
+                        preview_name,
                         cv2.resize(
                             frame,
-                            (int(preview_window_size()[0]), int(preview_window_size()[1])),
+                            preview_dims,
                             interpolation=cv2.INTER_LINEAR,
                         ),
                     )
@@ -538,10 +523,8 @@ def main():
                 make_debug_frame(
                     frame,
                     mapper,
-                    screen_mask,
                     result,
                     detection_mask,
-                    mode,
                 )
 
             # waitKey(1) keeps the fullscreen app responsive.

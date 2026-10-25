@@ -1,7 +1,6 @@
 opencv-python
 numpy
-picamera2
 
-# Raspberry Pi (CSI ribbon camera): do NOT pip install these.
-# Use the distro packages instead:
+# Raspberry Pi (CSI ribbon camera): picamera2 is NOT installed with pip.
+# Use the distro package instead:
 #   sudo apt install python3-picamera2 python3-opencv python3-numpy python3-tk

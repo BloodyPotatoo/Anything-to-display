@@ -1,10 +1,16 @@
 import sys
 import time
+
 import numpy as np
 import cv2
 
-from camera import open_camera, require_display, resolve_mode, CAMERA_WIDTH, CAMERA_HEIGHT, IR_EXPOSURE_US, IR_ANALOGUE_GAIN
-from coordinate_mapper import CoordinateMapper
+from camera import (
+    open_camera,
+    require_display,
+    CAMERA_WIDTH,
+    CAMERA_HEIGHT,
+)
+from coordinate_mapper import get_screen_size
 
 # ============================================================
 # SMARTIR - AUTOMATIC 9-POINT CALIBRATION
@@ -33,35 +39,33 @@ GRID_COLS = 3
 GRID_ROWS = 3
 NUM_POINTS = GRID_COLS * GRID_ROWS  # 9 points
 
-# Keep points away from screen edge by this fraction (0 = full edge-to-edge)
+# Keep points away from the screen edge by this many projector pixels
+# (0 = full edge-to-edge).
 GRID_INSET = 0.0
 
 # Point size in projector pixels
 POINT_RADIUS = 20
 
 # --- Auto-detection timing ---
-# Wait this many seconds the light is present before auto-capturing.
-# The timer only runs while the light is present, so a noisy/dim
-# sensor never has to hold the threshold for the full 2s in a row:
-# it just has to be ON for at least this long total.
-IR_CAPTURE_DURATION = 2.0  # seconds (light must be ON for this long)
+# The light must stay near the same point for this long before the
+# point is accepted. If it disappears or jumps outside the jitter
+# window, the hold timer restarts.
+IR_CAPTURE_DURATION = 2.0  # seconds (continuous hold)
 
 # How long to show each point on the projector before starting the
 # auto-detect timer. Together with the capture duration this is the
 # "exposure time" the calibration gives the pen.
 POINT_DISPLAY_TIME = 0.5  # seconds (shown before we start waiting)
 
-# How long to wait for the light per point. After the light has been
-# ON for IR_CAPTURE_DURATION we capture. If the light goes off we keep
-# waiting for a new spell.
-DETECT_TIMEOUT_PER_POINT = 12.0  # seconds (used as the real per-point timeout)
+# How long to wait for the light per point. If no sustained hold is
+# seen within this window, the point is skipped.
+DETECT_TIMEOUT_PER_POINT = 12.0  # seconds
 
 # How long to wait after capture before moving to next point.
 POINT_POST_CAPTURE_DELAY = 0.3  # seconds
 
 # --- Blob / detection limits ---
 POINT_MIN_AREA = 4
-POINT_MAX_AREA_RATIO = 0.05
 
 # Low-power IR sensor: the blob is always dim, and the detector uses a
 # fixed 25-px floor. Keep a small absolute floor as a safety net so
@@ -91,18 +95,20 @@ WARN_MEAN_ERROR_RATIO = 0.005
 # the window and the spell is aborted, so a wandering hand still
 # cannot stall the calibration.
 POINT_JITTER_WINDOW_PX = 60.0
-POINT_MIN_PRESENT_FRACTION = 0.4
+
+
+PROJECTOR_WINDOW = "PROJECTOR"
 
 
 def create_projector_window():
-    name = "PROJECTOR"
-    cv2.namedWindow(name, cv2.WINDOW_NORMAL)
+    """Create (or reuse) the fullscreen projector window."""
+    cv2.namedWindow(PROJECTOR_WINDOW, cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(
-        name,
+        PROJECTOR_WINDOW,
         cv2.WND_PROP_FULLSCREEN,
         cv2.WINDOW_FULLSCREEN,
     )
-    return name
+    return PROJECTOR_WINDOW
 
 
 def show_projector_point(window_name, x, y, width, height):
@@ -122,17 +128,6 @@ def show_projector_point(window_name, x, y, width, height):
     cv2.waitKey(1)
 
 
-def _adaptive_floor(gray, exposure_scale):
-    """Adaptive detection floor, independent of any fixed constant."""
-    # Base on the frame's own bright tail so a dim pen registers on
-    # a low-power sensor. The shutter (exposure) controls how much
-    # light the sensor collects, so the threshold follows the exposure.
-    floor = int(np.percentile(gray, 99) * 0.5)
-    floor = max(floor, int(gray.mean() * 0.7))
-    floor = max(floor, POINT_FLOOR)
-    return int(floor / max(exposure_scale, 1.0))
-
-
 def _find_light_points(gray):
     """Return the list of blob centroids in a frame.
 
@@ -148,7 +143,7 @@ def _find_light_points(gray):
     # that contains a bright blob (OTSU can collapse to 0 on a mostly
     # dark frame, which is what was dropping every contour earlier).
     _, binary = cv2.threshold(
-        gray_u8, 25, 255, cv2.THRESH_BINARY
+        gray_u8, POINT_FLOOR, 255, cv2.THRESH_BINARY
     )
 
     # The projected screen is the largest bright region, so remove it
@@ -212,19 +207,16 @@ def _resolve_exposure_scale(exposure_us, exposure_v4l2):
     return scale
 
 
-def _wait_for_ir_light(cap, duration, timeout, start_offset, exposure_us, exposure_v4l2):
+def _wait_for_ir_light(cap, duration, timeout):
     """Wait for the pen to be present for `duration` seconds.
 
     Returns the camera coordinates (x, y) of the captured point, or
     None if the timeout elapses without a sustained spell.
     """
-    exposure_scale = _resolve_exposure_scale(exposure_us, exposure_v4l2)
-
-    start_wait = time.time() + start_offset
+    start_wait = time.time()
     frames_collected = []
-    total_present_frames = 0
     best_point = None
-    best_point_frames = 0
+    present_since = None
 
     print(
         f"  Looking for IR light (must be present for {duration:.1f}s, "
@@ -253,42 +245,54 @@ def _wait_for_ir_light(cap, duration, timeout, start_offset, exposure_us, exposu
 
         candidates = _find_light_points(gray)
 
+        # Pick the brightest candidate of this frame. The score is
+        # the mean brightness of a small window around the centroid,
+        # which is cheap and stable even for a dim pen.
         this_frame_best = None
         if candidates:
-            # Pick the brightest candidate as the frame's best.
             best_score = -1.0
+            half = 5
+            frame_h, frame_w = gray.shape[:2]
+
             for (cx, cy) in candidates:
-                # Re-measure the local mean for a stable score.
-                x, y, w, h = cv2.boundingRect(_placeholder_contour(cx, cy, gray.shape))
-                if w <= 0 or h <= 0:
+                cx_i = int(round(cx))
+                cy_i = int(round(cy))
+                x0 = max(0, cx_i - half)
+                y0 = max(0, cy_i - half)
+                x1 = min(frame_w, cx_i + half + 1)
+                y1 = min(frame_h, cy_i + half + 1)
+                roi = gray[y0:y1, x0:x1]
+
+                if roi.size == 0:
                     continue
-                roi = gray[y:y + h, x:x + w]
-                roi_mask = np.zeros((h, w), dtype=np.uint8)
-                contour = _placeholder_contour(cx, cy, gray.shape)
-                cv2.drawContours(roi_mask, [contour], -1, 255, -1)
-                mean = cv2.mean(roi, mask=roi_mask)[0]
-                score = mean
+
+                score = float(roi.mean())
+
                 if score > best_score:
                     best_score = score
                     this_frame_best = (cx, cy)
 
         if this_frame_best is not None:
             cx, cy = this_frame_best
-            if best_point is None or (abs(cx - best_point[0]) <= POINT_JITTER_WINDOW_PX and abs(cy - best_point[1]) <= POINT_JITTER_WINDOW_PX):
+
+            if best_point is None or not (
+                abs(cx - best_point[0]) <= POINT_JITTER_WINDOW_PX
+                and abs(cy - best_point[1]) <= POINT_JITTER_WINDOW_PX
+            ):
+                # New lock (first detection, or the light jumped
+                # away from the previous point).
                 best_point = (cx, cy)
-                best_point_frames += 1
-                total_present_frames += 1
-            else:
-                best_point = None
-                best_point_frames = 1
-                total_present_frames += 1
+                present_since = time.time()
         else:
             best_point = None
-            best_point_frames = 0
+            present_since = None
 
-        # Human-error tolerance: keep the first stable point and
-        # drift it only while it stays inside a small window.
-        if best_point is not None and best_point_frames >= int(duration * POINT_MIN_PRESENT_FRACTION):
+        # The light must stay near the same point for the whole
+        # capture duration before the point is accepted.
+        if (
+            best_point is not None
+            and time.time() - present_since >= duration
+        ):
             elapsed = time.time() - start_wait
             print(
                 f"  IR light detected! Elapsed: {elapsed:.1f}s "
@@ -308,30 +312,22 @@ def _wait_for_ir_light(cap, duration, timeout, start_offset, exposure_us, exposu
         time.sleep(0.1)
 
 
-def _placeholder_contour(cx, cy, shape):
-    """Return a tiny contour approximating a point at (cx, cy)."""
-    h, w = shape[:2]
-    pts = np.array([[cx, cy]], dtype=np.float32).reshape(-1, 1, 2)
-    mask = np.zeros((h, w), dtype=np.uint8)
-    cv2.drawContours(mask, [pts], -1, 255, 1)
-    contour, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    return contour[0] if contour else pts
+def _open_camera_for_calibration(mode="ir"):
+    """Open the camera and return (capture, resolved_mode)."""
+    return open_camera(mode)
 
 
-def _open_camera_for_calibration():
-    """Open the camera in IR mode and return the resolved mode."""
-    cap, resolved_mode = open_camera("ir")
-    return cap, resolved_mode
+def _get_desktop_size():
+    """Return the projector/desktop size.
 
-
-def _get_desktop_size(mapper):
-    """Return the projector/desktop size, asking the user only when
-    no previous calibration exists and no stored size is available.
+    Uses the live desktop resolution, so calibration works on a fresh
+    install where no calibration file exists yet. Only asks the user
+    when the desktop size cannot be detected.
     """
-    try:
-        return int(mapper.screen_width), int(mapper.screen_height)
-    except (AttributeError, ValueError, TypeError):
-        pass
+    width, height, detected = get_screen_size()
+
+    if detected and width > 0 and height > 0:
+        return int(width), int(height)
 
     try:
         resp = input(
@@ -348,9 +344,13 @@ def _get_desktop_size(mapper):
         return 1280, 720
 
 
-def _capture_grid_points(cap, grid_points, screen_width, screen_height, frame_width, frame_height, exposure_us, exposure_v4l2):
-    """Show every grid point and auto-capture the pen on each one."""
-    camera_points = []
+def _capture_grid_points(cap, grid_points, screen_width, screen_height):
+    """Show every grid point and auto-capture the pen on each one.
+
+    Returns a list of ((camera_x, camera_y), (desktop_x, desktop_y))
+    pairs for the points that were actually measured.
+    """
+    measured_pairs = []
 
     for idx, (dx, dy) in enumerate(grid_points):
         point_idx = idx + 1
@@ -361,9 +361,9 @@ def _capture_grid_points(cap, grid_points, screen_width, screen_height, frame_wi
             flush=True,
         )
 
-        # Show the point on the projector
+        # Show the point on the projector.
         show_projector_point(
-            "PROJECTOR", dx, dy, screen_width, screen_height
+            PROJECTOR_WINDOW, dx, dy, screen_width, screen_height
         )
         # The point stays on screen so the pen can lock onto it
         # while we start the auto-detect timer.
@@ -377,95 +377,75 @@ def _capture_grid_points(cap, grid_points, screen_width, screen_height, frame_wi
             cap,
             duration=IR_CAPTURE_DURATION,
             timeout=DETECT_TIMEOUT_PER_POINT,
-            start_offset=0.0,
-            exposure_us=exposure_us,
-            exposure_v4l2=exposure_v4l2,
         )
 
         if point is not None:
             cx, cy = point
-            print(f"  Detected light at camera coordinates: ({cx:.1f}, {cy:.1f})")
-            camera_points.append((cx, cy))
+            print(
+                f"  Detected light at camera coordinates: "
+                f"({cx:.1f}, {cy:.1f})"
+            )
+            measured_pairs.append(
+                (point, (float(dx), float(dy)))
+            )
         else:
             print(f"  !!! No light detected at point {point_idx} - skipping it.")
             # Do NOT use a center placeholder: an un-measured point
             # would produce a garbage homography and be saved.
 
-        # Small pause before the next point
+        # Small pause before the next point.
         time.sleep(POINT_POST_CAPTURE_DELAY)
 
-    return camera_points
+    return measured_pairs
 
 
-def _compute_homography(camera_points, screen_width, screen_height):
-    """Fit camera -> desktop homography from the measured points.
+def _compute_homography(measured_pairs, screen_width, screen_height):
+    """Fit camera -> desktop homography from measured point pairs.
 
-    Every measured (camera, desktop) pair is used as a source
-    destination pair and fed to cv2.findHomography with RANSAC.
-    The reported residuals are the reprojection error over the FULL
-    set of measured points, so the accuracy report accounts for all
-    9 grid readings, not just the corners used to build the fit.
+    `measured_pairs` is a list of ((camera_x, camera_y),
+    (desktop_x, desktop_y)) tuples. Every pair is an independent
+    correspondence, so RANSAC has the full grid to work with and the
+    reported residuals cover all measured points.
     """
-    if len(camera_points) < MIN_POINTS_FOR_HOMOGRAPHY:
+    if len(measured_pairs) < MIN_POINTS_FOR_HOMOGRAPHY:
         return None, None
 
-    camera_pts = np.asarray(camera_points, dtype=np.float32)
+    measured_pairs = measured_pairs[:MAX_HOMOGRAPHY_PAIRS]
 
-    # Map each measured point to a known desktop position. The grid
-    # points are measured at DESKTOP coordinates, so the desktop
-    # pair is the grid point itself (all 9 pairs are independent:
-    # 9 correspondences -> much more robust RANSAC than 4).
-    desktop_pairs = np.array(
-        [
-            [
-                min(max(int(round(dx)), 0), screen_width - 1),
-                min(max(int(round(dy)), 0), screen_height - 1),
-            ]
-            for (dx, dy) in camera_points
-        ],
-        dtype=np.float32,
+    camera_pts = np.array(
+        [pair[0] for pair in measured_pairs], dtype=np.float32
+    )
+    desktop_pts = np.array(
+        [pair[1] for pair in measured_pairs], dtype=np.float32
     )
 
-    # Use at most the 9 points the grid supplies; rely on RANSAC on
-    # however many were actually measured.
-    pairs = min(len(camera_points), MAX_HOMOGRAPHY_PAIRS)
-    src = camera_pts[:pairs].reshape(-1, 1, 2)
-    dst = desktop_pairs[:pairs].reshape(-1, 1, 2)
-
-    matrix = cv2.findHomography(
-        src, dst, cv2.RANSAC, RANSAC_REPROJECTION_PX
+    # Keep every target inside the desktop. The grid is already in
+    # range; this also protects against out-of-range custom points.
+    desktop_pts[:, 0] = np.clip(
+        desktop_pts[:, 0], 0, screen_width - 1
+    )
+    desktop_pts[:, 1] = np.clip(
+        desktop_pts[:, 1], 0, screen_height - 1
     )
 
-    if matrix is None:
+    # cv2.findHomography returns (matrix, mask).
+    matrix, _mask = cv2.findHomography(
+        camera_pts,
+        desktop_pts,
+        cv2.RANSAC,
+        RANSAC_REPROJECTION_PX,
+    )
+
+    if matrix is None or matrix.size == 0:
         return None, None
 
     matrix = matrix.astype(np.float32)
 
-    # Reprojection error check on the full set of measured points,
-    # so the accuracy report is still meaningful and accounts for
-    # all 9 grid readings, not just the points used for the fit.
-    if len(camera_points) > pairs:
-        all_camera = np.asarray(camera_points, dtype=np.float32)
-        all_desktop = np.array(
-            [
-                [
-                    min(max(int(round(dx)), 0), screen_width - 1),
-                    min(max(int(round(dy)), 0), screen_height - 1),
-                ]
-                for (dx, dy) in camera_points
-            ],
-            dtype=np.float32,
-        )
-        projected = cv2.perspectiveTransform(
-            all_camera.reshape(-1, 1, 2), matrix
-        ).reshape(-1, 2)
-        errors = np.linalg.norm(projected - all_desktop, axis=1)
-    else:
-        projected = cv2.perspectiveTransform(
-            camera_pts.reshape(-1, 1, 2), matrix
-        ).reshape(-1, 2)
-        errors = np.linalg.norm(projected - desktop_pairs, axis=1)
-
+    # Reprojection error over every measured pair.
+    projected = cv2.perspectiveTransform(
+        camera_pts.reshape(-1, 1, 2), matrix
+    ).reshape(-1, 2)
+    errors = np.linalg.norm(projected - desktop_pts, axis=1)
     mean_error = float(errors.mean())
 
     print("Per-point camera->desktop residuals (px):")
@@ -473,7 +453,49 @@ def _compute_homography(camera_points, screen_width, screen_height):
         print(f"  point {i + 1}: {err:7.2f}px")
 
     print(f"Mean reprojection error: {mean_error:.2f} px")
+
+    diagonal = float(np.hypot(screen_width, screen_height))
+
+    if diagonal > 0 and mean_error > WARN_MEAN_ERROR_RATIO * diagonal:
+        print(
+            "WARNING: mean reprojection error is above "
+            f"{WARN_MEAN_ERROR_RATIO * 100:.1f}% of the desktop diagonal. "
+            "Something may have moved during the sweep."
+        )
+
     return matrix, mean_error
+
+
+def _derive_screen_corners(homography, screen_width, screen_height):
+    """Inverse-map the desktop rectangle through the homography to get
+    the four calibrated screen corners in camera space."""
+    try:
+        inverse = np.linalg.inv(
+            np.asarray(homography, dtype=np.float64)
+        ).astype(np.float32)
+    except np.linalg.LinAlgError:
+        raise RuntimeError(
+            "The homography is singular; cannot derive screen corners."
+        )
+
+    rect = np.array(
+        [
+            [0, 0],
+            [screen_width - 1, 0],
+            [screen_width - 1, screen_height - 1],
+            [0, screen_height - 1],
+        ],
+        dtype=np.float32,
+    )
+
+    camera_corners = cv2.perspectiveTransform(
+        rect.reshape(-1, 1, 2), inverse
+    ).reshape(-1, 2)
+
+    # The desktop rectangle is supplied in TL, TR, BR, BL order, and a
+    # non-degenerate homography preserves that order, so no re-ordering
+    # heuristic is needed here.
+    return camera_corners.astype(np.float32)
 
 
 def _save_calibration(camera_corners, homography, frame_width, frame_height, screen_width, screen_height):
@@ -506,65 +528,23 @@ def order_corners_tlbr(points):
     ordered[2] = points[np.argmax(sums)]  # BR
 
     diffs = points[:, 0] - points[:, 1]
-    ordered[1] = points[np.argmin(diffs)]  # TR
-    ordered[3] = points[np.argmax(diffs)]  # BL
+    ordered[1] = points[np.argmax(diffs)]  # TR
+    ordered[3] = points[np.argmin(diffs)]  # BL
 
     return ordered
 
 
-def _detect_screen(width, height, frame_width, frame_height):
-    """STEP 1 (automatic): capture the RGBW color phase and return the
-    calibrated screen polygon (4 x 2 float32).
+def _screen_corners_from_frames(frames, frame_width, frame_height):
+    """Compute the screen polygon from RGBW colour-phase captures.
 
-    Throws RuntimeError if the screen cannot be found; never writes a
-    partial calibration.
+    `frames` is a sequence of BGR frames. Returns the screen polygon
+    (4 x 2 float32) in camera space. This is a pure function so it can
+    be exercised by tests without a camera or a projector.
     """
-    cap, resolved_mode = _open_camera_for_calibration()
-
-    print(f"Capture size: {frame_width} x {frame_height}")
-
-    # Capture the four color phases. The detector focuses on the
-    # projected screen so it reads the projector, which is what we
-    # want for the mask.
-    frames = {}
-    name = "PROJECTOR"
-    cv2.namedWindow(name, cv2.WINDOW_NORMAL)
-
-    print("\nSTEP 1/2: Capturing RED, GREEN, BLUE, WHITE color phases...")
-
-    for color in ("red", "green", "blue", "white"):
-        # Clear the projector window between phases
-        cv2.destroyWindow(name)
-        cv2.namedWindow(name, cv2.WINDOW_NORMAL)
-
-        if color == "red":
-            image = np.zeros((frame_height, frame_width, 3), dtype=np.uint8)
-            image[:, :] = (0, 0, 255)
-        elif color == "green":
-            image = np.zeros((frame_height, frame_width, 3), dtype=np.uint8)
-            image[:, :] = (0, 255, 0)
-        elif color == "blue":
-            image = np.zeros((frame_height, frame_width, 3), dtype=np.uint8)
-            image[:, :] = (255, 0, 0)
-        else:
-            image = np.full((frame_height, frame_width, 3), 255, dtype=np.uint8)
-
-        cv2.imshow(name, image)
-        cv2.waitKey(500)
-
-        ret, frame = cap.read()
-        if ret and frame is not None and frame.size:
-            cv2.destroyWindow(name)
-            frames[color] = frame
-        else:
-            print(f"  !!! Could not capture {color} frame from camera.")
-            cv2.destroyWindow(name)
-            continue
-
-    cv2.destroyWindow(name)
-
     if not frames:
-        raise RuntimeError("Could not capture any color phase from the camera.")
+        raise RuntimeError(
+            "Could not capture any color phase from the camera."
+        )
 
     print("  Computing screen mask from the RGBW color change...")
 
@@ -573,79 +553,154 @@ def _detect_screen(width, height, frame_width, frame_height):
     # colour between phases; everything else (camera, furniture, wall)
     # is identical in all four captures.
     lab_frames = [
-        cv2.cvtColor(f, cv2.COLOR_BGR2LAB) for f in frames.values()
+        cv2.cvtColor(frame, cv2.COLOR_BGR2LAB) for frame in frames
     ]
     diffs = []
     for i in range(len(lab_frames)):
         for j in range(i + 1, len(lab_frames)):
-            diffs.append(np.abs(lab_frames[i].astype(np.int16) - lab_frames[j].astype(np.int16)))
+            diffs.append(
+                np.abs(
+                    lab_frames[i].astype(np.int16)
+                    - lab_frames[j].astype(np.int16)
+                )
+            )
 
     combined = np.zeros_like(lab_frames[0])
-    for d in diffs:
-        combined = np.maximum(combined, d)
+    for diff in diffs:
+        combined = np.maximum(combined, diff)
 
-    # The screen changes colour strongly; everything else barely moves.
-    # Threshold the combined Lab delta. 60 is a safe floor for a
-    # projector seen by a normal webcam; raise it if we see noise.
-    # The Lab delta is large for the screen and near-zero for the
-    # unchanged desk. Convert the delta image back to a brightness
-    # image and threshold it at a safe floor; the screen is the only
-    # thing that moves, so the threshold is on the change, not on
-    # the absolute colour.
+    # Convert the Lab delta back to a brightness image and threshold
+    # it with Otsu. The screen is the only thing that changes, so the
+    # threshold is on the change, not on the absolute colour.
     mask = np.clip(combined, 0, 255).astype(np.uint8)
     mask = cv2.cvtColor(mask, cv2.COLOR_LAB2BGR)
     mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
-    mask = cv2.threshold(mask, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+    mask = cv2.threshold(
+        mask, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )[1]
 
-    # Fill holes and keep only the largest connected region (the screen)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
-    n, labels, stats, cents = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    # Fill holes and keep only the largest connected region (the screen).
+    mask = cv2.morphologyEx(
+        mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8)
+    )
+    n, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        mask, connectivity=8
+    )
     if n > 1:
         largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
         mask = (labels == largest).astype(np.uint8) * 255
 
-    # Approximate corners from the filled screen region
+    # Approximate corners from the filled screen region.
     contours, _ = cv2.findContours(
         mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
     if not contours:
-        raise RuntimeError("Could not find the projected screen in the color phase.")
+        raise RuntimeError(
+            "Could not find the projected screen in the color phase."
+        )
 
     largest = max(contours, key=cv2.contourArea)
     epsilon = 0.02 * cv2.arcLength(largest, True)
-    screen_corners = cv2.approxPolyDP(largest, epsilon, True).reshape(-1, 2)
+    screen_corners = cv2.approxPolyDP(
+        largest, epsilon, True
+    ).reshape(-1, 2)
 
-    # Ensure we always have 4 corners
+    # Ensure we always have 4 corners.
     if len(screen_corners) != 4:
-        screen_corners = np.array([
-            [0, 0],
-            [frame_width - 1, 0],
-            [frame_width - 1, frame_height - 1],
-            [0, frame_height - 1],
-        ], dtype=np.float32)
+        screen_corners = np.array(
+            [
+                [0, 0],
+                [frame_width - 1, 0],
+                [frame_width - 1, frame_height - 1],
+                [0, frame_height - 1],
+            ],
+            dtype=np.float32,
+        )
 
-    # Order as TL, TR, BR, BL
-    screen_corners = order_corners_tlbr(screen_corners)
-
-    # Scale from capture resolution to the projector's resolution so
-    # the mask is in projector space (the space the points live in).
-    # NOTE: the projector output resolution is not knowable from a
-    # camera feed; the caller passes the measured desktop resolution
-    # and this function scales the detected corners into that space.
-    # Keep the scaling but validate it so a mismatched desktop size
-    # is reported instead of silently corrupting the geometry.
-    print(f"  Detected screen area: {100.0 * cv2.contourArea(screen_corners.astype(np.int32)) / float(frame_width * frame_height):.1f}% of the frame")
-    print(f"  Screen corners (in projector space): {screen_corners}")
-
-    return screen_corners.astype(np.float32), frame_width, frame_height
+    # Order as TL, TR, BR, BL.
+    return order_corners_tlbr(screen_corners).astype(np.float32)
 
 
-def main():
+def _detect_screen(cap, frame_width, frame_height,
+                   screen_width, screen_height):
+    """STEP 1 (automatic): capture the RGBW color phase and return the
+    calibrated screen polygon (4 x 2 float32) in camera space.
+
+    Uses the already-open capture so a second camera stream is never
+    opened. Throws RuntimeError if the screen cannot be found; never
+    writes a partial calibration.
+    """
+    print(f"Capture size: {frame_width} x {frame_height}")
+
+    frames = {}
+    name = create_projector_window()
+
+    print("\nSTEP 1/2: Capturing RED, GREEN, BLUE, WHITE color phases...")
+
+    for color in ("red", "green", "blue", "white"):
+        if color == "red":
+            image = np.zeros(
+                (screen_height, screen_width, 3), dtype=np.uint8
+            )
+            image[:, :] = (0, 0, 255)
+        elif color == "green":
+            image = np.zeros(
+                (screen_height, screen_width, 3), dtype=np.uint8
+            )
+            image[:, :] = (0, 255, 0)
+        elif color == "blue":
+            image = np.zeros(
+                (screen_height, screen_width, 3), dtype=np.uint8
+            )
+            image[:, :] = (255, 0, 0)
+        else:
+            image = np.full(
+                (screen_height, screen_width, 3), 255, dtype=np.uint8
+            )
+
+        cv2.imshow(name, image)
+        cv2.waitKey(500)
+
+        # Read two frames so a buffer from before the colour change is
+        # not mistaken for the current phase.
+        frame = None
+        for _ in range(2):
+            ret, captured = cap.read()
+            if ret and captured is not None and captured.size:
+                frame = captured
+
+        if frame is not None:
+            frames[color] = frame
+        else:
+            print(f"  !!! Could not capture {color} frame from camera.")
+
+    screen_corners = _screen_corners_from_frames(
+        list(frames.values()), frame_width, frame_height
+    )
+
+    print(
+        f"  Detected screen area: "
+        f"{100.0 * cv2.contourArea(screen_corners.astype(np.int32)) / float(frame_width * frame_height):.1f}% of the frame"
+    )
+    print(f"  Screen corners (in camera space): {screen_corners}")
+
+    return screen_corners
+
+
+def main(mode="auto"):
     cap = None
-    projector_window = None
 
     try:
         require_display()
+
+        # Allow "python3 calibration.py visible|ir|auto" as documented
+        # in the README. An explicit argument wins over the caller's
+        # default so main.py can pass a mode programmatically.
+        if len(sys.argv) > 1:
+            cli_mode = sys.argv[1].strip().lower()
+
+            if cli_mode in ("visible", "ir", "auto"):
+                mode = cli_mode
 
         print("\n" + "=" * 60)
         print("SMARTIR - AUTOMATIC RGBW + 9-POINT CALIBRATION")
@@ -656,18 +711,15 @@ def main():
         )
         print("  STEP 1: the projector cycles RED -> GREEN -> BLUE -> WHITE "
               "and the screen is detected automatically")
-        print(f"  STEP 2: 9 reference points are projected and the pen is "
-              f"auto-detected on each of them")
+        print("  STEP 2: 9 reference points are projected and the pen is "
+              "auto-detected on each of them")
         print("=" * 60)
 
-        exposure_us = int(os.environ.get("SMARTIR_EXPOSURE_US", "40000"))
-        exposure_v4l2 = int(os.environ.get("SMARTIR_V4L2_EXPOSURE", "16"))
+        print(f"\nOpening camera in {mode} mode...")
+        cap, resolved_mode = _open_camera_for_calibration(mode)
+        print(f"Resolved camera mode: {resolved_mode}")
 
-        print(f"\nOpening camera in IR mode (exposure {exposure_us}us, "
-              f"V4L2 exposure {exposure_v4l2})...")
-        cap, resolved_mode = _open_camera_for_calibration()
-
-        # Determine the real capture size
+        # Determine the real capture size.
         ret, probe = cap.read()
         if ret and probe is not None and probe.size:
             frame_height, frame_width = probe.shape[:2]
@@ -677,14 +729,23 @@ def main():
         print(f"Capture size: {frame_width} x {frame_height}")
 
         # Determine the desktop/projector size.
-        mapper = CoordinateMapper()
-        screen_width, screen_height = _get_desktop_size(mapper)
+        screen_width, screen_height = _get_desktop_size()
+
+        # One fullscreen projector window is used by both steps so the
+        # projected points land at their real desktop coordinates.
+        create_projector_window()
 
         # ------------------------------------------------------------------
-        # STEP 1 (automatic): RGBW color phase -> calibrated screen mask
+        # STEP 1 (automatic): RGBW color phase -> calibrated screen corners
         # ------------------------------------------------------------------
         print("\nSTEP 1/2: detecting the projected screen...")
-        screen_corners, step1_frame_width, step1_frame_height = _detect_screen(screen_width, screen_height, frame_width, frame_height)
+        screen_corners = _detect_screen(
+            cap,
+            frame_width,
+            frame_height,
+            screen_width,
+            screen_height,
+        )
 
         # ------------------------------------------------------------------
         # STEP 2 (automatic): 9-point grid -> homography
@@ -694,19 +755,21 @@ def main():
 
         grid_points = build_grid_points(screen_width, screen_height)
 
-        camera_points = _capture_grid_points(
-            cap, grid_points, screen_width, screen_height,
-            frame_width, frame_height, exposure_us, exposure_v4l2,
+        measured_pairs = _capture_grid_points(
+            cap, grid_points, screen_width, screen_height
         )
 
-        # If any points were measured, fit the homography.
-        if len(camera_points) < MIN_POINTS_FOR_HOMOGRAPHY:
+        if len(measured_pairs) < MIN_POINTS_FOR_HOMOGRAPHY:
             raise RuntimeError(
-                f"Not enough measured points ({len(camera_points)} < {MIN_POINTS_FOR_HOMOGRAPHY}). "
-                "Make sure the pen is visible to the camera during the point sweep."
+                f"Not enough measured points "
+                f"({len(measured_pairs)} < {MIN_POINTS_FOR_HOMOGRAPHY}). "
+                "Make sure the pen is visible to the camera during the "
+                "point sweep."
             )
 
-        homography, mean_error = _compute_homography(camera_points, screen_width, screen_height)
+        homography, mean_error = _compute_homography(
+            measured_pairs, screen_width, screen_height
+        )
 
         if homography is None:
             raise RuntimeError(
@@ -716,8 +779,18 @@ def main():
 
         print(f"Mean reprojection error: {mean_error:.2f} px")
 
-        # Derive the screen corners by inverse-mapping the desktop rectangle
-        camera_corners = _derive_screen_corners(homography, screen_width, screen_height)
+        # Derive the screen corners by inverse-mapping the desktop
+        # rectangle. Fall back to the RGBW corners if that is impossible.
+        try:
+            camera_corners = _derive_screen_corners(
+                homography, screen_width, screen_height
+            )
+        except RuntimeError as error:
+            print(
+                f"\nWARNING: {error}\n"
+                "         Using the RGBW screen corners instead."
+            )
+            camera_corners = screen_corners
 
         # ------------------------------------------------------------------
         # SAVE CALIBRATION
@@ -736,7 +809,9 @@ def main():
         # ------------------------------------------------------------------
         ret, last_frame = cap.read()
         if not ret or last_frame is None:
-            last_frame = np.zeros((frame_height, frame_width, 3), dtype=np.uint8)
+            last_frame = np.zeros(
+                (frame_height, frame_width, 3), dtype=np.uint8
+            )
 
         result = cv2.drawContours(
             last_frame,
@@ -752,6 +827,13 @@ def main():
                 result, label, (x + 12, y - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2,
             )
+
+        # Close the fullscreen projector window so the result view is
+        # actually visible.
+        try:
+            cv2.destroyWindow(PROJECTOR_WINDOW)
+        except cv2.error:
+            pass
 
         cv2.imshow("FINAL CALIBRATION", result)
         print("\nCalibration complete!")
@@ -775,14 +857,20 @@ def main():
         cv2.destroyAllWindows()
 
 
-def build_grid_points(width, height, cols=GRID_COLS, rows=GRID_ROWS, inset=GRID_INSET):
+def build_grid_points(width, height, cols=GRID_COLS, rows=GRID_ROWS,
+                      inset=GRID_INSET):
     """Build reference points at known DESKTOP coordinates.
-    Grid is cols x rows, covering the full screen with optional inset.
-    Row-major, starting top-left.
+
+    The grid is cols x rows and covers the full screen with an
+    optional inset (in pixels). Row-major, starting top-left. Points
+    always stay inside the valid pixel range [0, width-1] x
+    [0, height-1], so the last column/row is not one pixel off-screen.
     """
     points = []
-    cell_w = (width - 2 * inset) / float(cols - 1) if cols > 1 else width
-    cell_h = (height - 2 * inset) / float(rows - 1) if rows > 1 else height
+    span_w = max(0.0, float(width - 1) - 2.0 * inset)
+    span_h = max(0.0, float(height - 1) - 2.0 * inset)
+    cell_w = span_w / float(cols - 1) if cols > 1 else 0.0
+    cell_h = span_h / float(rows - 1) if rows > 1 else 0.0
 
     for row in range(rows):
         for col in range(cols):

@@ -11,23 +11,10 @@ def calibration_exists():
 
 
 def run_calibration(mode="auto"):
-    """Start the calibration application.
-
-    calibration.py's main() is re-entrant: it reads its mode from the
-    first CLI argument, so we only call it if we are not already
-    inside that function.  main.py is the designated entry point so
-    it delegates here directly instead of spawning a nested process
-    whose __main__ guard would run calibration a second time.
-    """
+    """Launch the calibration application."""
     from calibration import main as calibration_main
 
-    # Pass the mode through so calibration.py does not ask for it
-    # interactively when launched from main.py.
-    import sys as _sys
-
-    if _sys.argv[1:] and _sys.argv[1] != "visible":
-        _sys.argv = ["calibration.py", _sys.argv[1]]
-    calibration_main()
+    calibration_main(mode)
 
 
 def run_whiteboard():

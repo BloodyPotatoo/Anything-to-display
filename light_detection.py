@@ -3,7 +3,14 @@ import sys
 import cv2
 import numpy as np
 
-from camera import open_camera, require_display, resolve_mode, preview_window, cleanup_preview
+from camera import (
+    open_camera,
+    require_display,
+    resolve_mode,
+    preview_size,
+    preview_window,
+    cleanup_preview,
+)
 from coordinate_mapper import CoordinateMapper
 
 # ============================================================
@@ -329,13 +336,16 @@ def run_light_detection(mapper, mode="visible"):
             )
 
             # Live preview of what the camera sees (only if enabled).
-            if preview_window() is not None:
+            preview_name = preview_window()
+            preview_dims = preview_size()
+
+            if preview_name is not None and preview_dims is not None:
                 try:
                     cv2.imshow(
-                        preview_window(),
+                        preview_name,
                         cv2.resize(
                             frame,
-                            (int(preview_window_size()[0]), int(preview_window_size()[1])),
+                            preview_dims,
                             interpolation=cv2.INTER_LINEAR,
                         ),
                     )

@@ -38,8 +38,11 @@ DETECTION
 PC:
 
 ```bash
-pip install opencv-python numpy picamera2
+pip install opencv-python numpy
 ```
+
+`picamera2` is Raspberry Pi only and is installed with the distro
+packages below, not with pip.
 
 Raspberry Pi (use the distro packages - they match the camera stack):
 
@@ -243,8 +246,8 @@ stroke starts on the next detection).
   an IR-filtered camera.
 - High reprojection error: something moved between captures, or the
   projector and desktop resolutions do not match.
-- Detection too noisy: raise the threshold in
-  `light_detection.py` (`IR_THRESHOLD` / `VISIBLE_THRESHOLD`).
+- Detection too noisy: tune `IR_RATIO` / `VISIBLE_RATIO` in
+  `light_detection.py` (higher ratio = stricter threshold).
 
 The PiCameraStream class in `camera.py` calls `self._camera.capture_array("main")`
 inside `read()` (not `self._camera.close()`, which would stop the

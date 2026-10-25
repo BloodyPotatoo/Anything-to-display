@@ -8,10 +8,13 @@ import cv2
 import numpy as np
 
 from calibration import (
-    _detect_screen,
+    _compute_homography,
+    _derive_screen_corners,
+    _screen_corners_from_frames,
     _find_light_points,
     _resolve_exposure_scale,
     build_grid_points,
+    order_corners_tlbr,
 )
 
 
@@ -56,6 +59,73 @@ def test_build_grid_points():
     assert abs(pts[-1][1] - 719) <= 1
 
 
+def test_compute_homography_uses_correct_desktop_pairs():
+    # The camera sees the desktop rectangle as a quadrilateral. Build
+    # the measured pairs by inverse-mapping the desktop grid, then make
+    # sure the fitted homography maps camera -> desktop (not camera ->
+    # camera, which is what happened when the desktop pairs were built
+    # from the camera points themselves).
+    cam_corners = np.array(
+        [[100, 80], [560, 120], [520, 430], [80, 390]],
+        dtype=np.float32,
+    )
+    desk_corners = np.array(
+        [[0, 0], [1919, 0], [1919, 1079], [0, 1079]],
+        dtype=np.float32,
+    )
+    h_true = cv2.getPerspectiveTransform(cam_corners, desk_corners)
+
+    grid = np.array(build_grid_points(1920, 1080), dtype=np.float32)
+    cam_pts = cv2.perspectiveTransform(
+        grid.reshape(-1, 1, 2), np.linalg.inv(h_true)
+    ).reshape(-1, 2)
+    pairs = [(tuple(c), tuple(d)) for c, d in zip(cam_pts, grid)]
+
+    homography, error = _compute_homography(pairs, 1920, 1080)
+
+    assert homography is not None
+    assert error < 0.01
+
+    mapped = cv2.perspectiveTransform(
+        cam_pts.reshape(-1, 1, 2), homography
+    ).reshape(-1, 2)
+    assert np.allclose(mapped, grid, atol=0.5)
+
+
+def test_derive_screen_corners_round_trip():
+    cam_corners = np.array(
+        [[100, 80], [560, 120], [520, 430], [80, 390]],
+        dtype=np.float32,
+    )
+    desk_corners = np.array(
+        [[0, 0], [1919, 0], [1919, 1079], [0, 1079]],
+        dtype=np.float32,
+    )
+    homography = cv2.getPerspectiveTransform(cam_corners, desk_corners)
+
+    corners = _derive_screen_corners(homography, 1920, 1080)
+
+    assert corners.shape == (4, 2)
+    assert np.allclose(corners, cam_corners, atol=0.5)
+
+    back = cv2.perspectiveTransform(
+        corners.reshape(-1, 1, 2), homography
+    ).reshape(-1, 2)
+    assert np.allclose(back, desk_corners, atol=0.5)
+
+
+def test_order_corners_tlbr():
+    rect = np.array(
+        [[0, 0], [10, 0], [10, 10], [0, 10]],
+        dtype=np.float32,
+    )
+    shuffled = rect[[2, 0, 3, 1]]
+
+    ordered = order_corners_tlbr(shuffled)
+
+    assert np.allclose(ordered, rect)
+
+
 def test_detect_screen_with_synthetic_projector_frame():
     # Build a synthetic "camera view" where only a projected rectangle
     # changes colour between the RGBW phases. The rest of the frame
@@ -71,11 +141,8 @@ def test_detect_screen_with_synthetic_projector_frame():
         frame[330:400, 50:100] = (80, 80, 80)
         frames.append(frame)
 
-    # capture_w / capture_h are the IMAGE size, not the desktop size.
     image_w, image_h = frames[0].shape[1], frames[0].shape[0]
-    corners, capture_w, capture_h = _detect_screen(
-        width, height, image_w, image_h
-    )
+    corners = _screen_corners_from_frames(frames, image_w, image_h)
 
     assert corners.shape == (4, 2)
     xs = corners[:, 0]
@@ -84,6 +151,3 @@ def test_detect_screen_with_synthetic_projector_frame():
     # the synthetic projector region was.
     assert xs.min() < 300 and xs.max() > 340
     assert ys.min() < 250 and ys.max() > 290
-    # capture_w / capture_h are the camera image dimensions
-    assert capture_w == image_w
-    assert capture_h == image_h

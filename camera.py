@@ -1,4 +1,5 @@
 import glob
+import importlib.util
 import os
 import platform
 import sys
@@ -241,50 +242,6 @@ def is_raspberry_pi():
     return is_arm and platform.system() == "Linux"
 
 
-def _resolution_from_env():
-    raw = os.environ.get("SMARTIR_RES", "").strip().lower()
-
-    if not raw:
-        return None
-
-    try:
-        width_text, height_text = raw.split("x")
-        width = int(width_text)
-        height = int(height_text)
-
-        if width >= 160 and height >= 120:
-            return width, height
-
-        raise ValueError("resolution too small")
-
-    except ValueError:
-        print(
-            f"WARN: ignoring SMARTIR_RES={raw} "
-            "(expected WIDTHxHEIGHT, e.g. 640x480)"
-        )
-        return None
-
-
-def _default_resolution():
-    custom = _resolution_from_env()
-
-    if custom is not None:
-        return custom
-
-    if is_raspberry_pi():
-        return DEFAULT_PI_WIDTH, DEFAULT_PI_HEIGHT
-
-    return DEFAULT_PC_WIDTH, DEFAULT_PC_HEIGHT
-
-
-CAMERA_WIDTH, CAMERA_HEIGHT = _default_resolution()
-
-try:
-    CAMERA_FPS = int(os.environ.get("SMARTIR_FPS", str(DEFAULT_FPS)))
-except ValueError:
-    CAMERA_FPS = DEFAULT_FPS
-
-
 def _resolution_from_env(name, default):
     """Parse a WIDTHxHEIGHT env var, returning the default if unset/invalid."""
     raw = os.environ.get(name, "").strip().lower()
@@ -304,9 +261,27 @@ def _resolution_from_env(name, default):
     except ValueError:
         print(
             f"WARN: ignoring {name}={raw} "
-            f"(expected WIDTHxHEIGHT, e.g. 640x480); using {default[0]}x{default[1]}"
+            f"(expected WIDTHxHEIGHT, e.g. 640x480); "
+            f"using {default[0]}x{default[1]}"
         )
         return default
+
+
+def _default_resolution():
+    if is_raspberry_pi():
+        default = (DEFAULT_PI_WIDTH, DEFAULT_PI_HEIGHT)
+    else:
+        default = (DEFAULT_PC_WIDTH, DEFAULT_PC_HEIGHT)
+
+    return _resolution_from_env("SMARTIR_RES", default)
+
+
+CAMERA_WIDTH, CAMERA_HEIGHT = _default_resolution()
+
+try:
+    CAMERA_FPS = int(os.environ.get("SMARTIR_FPS", str(DEFAULT_FPS)))
+except ValueError:
+    CAMERA_FPS = DEFAULT_FPS
 
 
 _PREVIEW_ENABLED = os.environ.get("SMARTIR_PREVIEW", "1").strip().lower() in (
@@ -321,6 +296,9 @@ if _PREVIEW_ENABLED:
     _PREVIEW_WIDTH, _PREVIEW_HEIGHT = _PREVIEW_RES
 else:
     _PREVIEW_WIDTH = _PREVIEW_HEIGHT = None
+
+# Name of the live preview window, or None while it is not open.
+_PREVIEW_WINDOW = None
 
 
 def preview_enabled():
@@ -535,18 +513,29 @@ def create_preview_window(window_name, width, height):
     The preview is only a view of the camera; detection works on the
     full-resolution frame, so the preview never limits detection.
     """
-    if width <= 0 or height <= 0:
+    if width is None or height is None or width <= 0 or height <= 0:
         return None
 
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, width, height)
-    cv2.setWindowProperty(
-        window_name,
-        cv2.WND_PROP_FULLSCREEN,
-        cv2.WINDOW_FULLSCREEN,
-    )
 
     return window_name
+
+
+def _ensure_preview_window():
+    """Create the preview window once, if previews are enabled."""
+    global _PREVIEW_WINDOW
+
+    if not _PREVIEW_ENABLED or _PREVIEW_WINDOW is not None:
+        return _PREVIEW_WINDOW
+
+    _PREVIEW_WINDOW = create_preview_window(
+        "SMARTIR Camera Preview",
+        _PREVIEW_WIDTH,
+        _PREVIEW_HEIGHT,
+    )
+
+    return _PREVIEW_WINDOW
 
 
 def draw_preview(window_name, frame, width, height):
@@ -569,7 +558,8 @@ def draw_preview(window_name, frame, width, height):
 def _try_open_picamera2(resolved_mode):
     """Open the CSI ribbon camera through picamera2, if available."""
     try:
-        from picamera2 import Picamera2  # noqa: F401
+        if importlib.util.find_spec("picamera2") is None:
+            return None
     except Exception:
         return None
 
@@ -793,6 +783,7 @@ def open_camera(mode="visible"):
         )
 
         if cap is not None:
+            _ensure_preview_window()
             return cap, resolved_mode
 
         print("WARN: could not open SMARTIR_CAM source. Falling back.")
@@ -809,12 +800,7 @@ def open_camera(mode="visible"):
 
         if stream is not None:
             # Start a small live preview of what the camera sees.
-            if _PREVIEW_ENABLED:
-                _PREVIEW_WINDOW = create_preview_window(
-                    "SMARTIR Camera Preview",
-                    _PREVIEW_WIDTH,
-                    _PREVIEW_HEIGHT,
-                )
+            _ensure_preview_window()
 
             return stream, resolved_mode
 
@@ -853,29 +839,9 @@ def open_camera(mode="visible"):
 
         if cap is not None:
             # Start a small live preview of what the camera sees.
-            if _PREVIEW_ENABLED:
-                _PREVIEW_WINDOW = create_preview_window(
-                    "SMARTIR Camera Preview",
-                    _PREVIEW_WIDTH,
-                    _PREVIEW_HEIGHT,
-                )
+            _ensure_preview_window()
 
             return cap, resolved_mode
-
-    # --------------------------------------------------------
-    # 4. Show the preview alongside the camera
-    # --------------------------------------------------------
-    if _PREVIEW_ENABLED:
-        # Only create the preview when the camera actually opened.
-        # The del above is a no-op when the camera failed: there was
-        # no _PREVIEW_WINDOW to delete, so skip the delete entirely.
-        if "PREVIEW_WINDOW" in globals():
-            del _PREVIEW_WINDOW
-        _PREVIEW_WINDOW = create_preview_window(
-            "SMARTIR Camera Preview",
-            _PREVIEW_WIDTH,
-            _PREVIEW_HEIGHT,
-        )
 
     raise RuntimeError(
         "No usable camera found.\n"
@@ -894,8 +860,6 @@ def open_camera(mode="visible"):
 # the preview never slows down or lowers detection quality.
 # ============================================================
 
-_PREVIEW_WINDOW = None
-
 
 def preview_window():
     """Return the preview window name, or None when hidden."""
@@ -907,5 +871,8 @@ def cleanup_preview():
     global _PREVIEW_WINDOW
 
     if _PREVIEW_WINDOW is not None:
-        cv2.destroyWindow(_PREVIEW_WINDOW)
+        try:
+            cv2.destroyWindow(_PREVIEW_WINDOW)
+        except cv2.error:
+            pass
         _PREVIEW_WINDOW = None
